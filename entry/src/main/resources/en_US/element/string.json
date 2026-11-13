@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Local video player entry module"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Player entry"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Media Player"
+    },
+    {
+      "name": "app_title",
+      "value": "Media Player"
+    },
+    {
+      "name": "reason_download",
+      "value": "To read and play videos in the Download directory"
+    }
+  ]
+}

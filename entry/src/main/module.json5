@@ -1,0 +1,101 @@
+{
+  "module": {
+    "name": "entry",
+    "type": "entry",
+    "description": "$string:module_desc",
+    "mainElement": "EntryAbility",
+    "deviceTypes": [
+      "phone",
+      "tablet",
+      "2in1"
+    ],
+    "metadata": [
+      {
+        "name": "network_config",
+        "resource": "$profile:network_config"
+      }
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    "abilities": [
+      {
+        "name": "EntryAbility",
+        "srcEntry": "./ets/entryability/EntryAbility.ets",
+        "description": "$string:EntryAbility_desc",
+        "icon": "$media:layered_image",
+        "label": "$string:EntryAbility_label",
+        "startWindowIcon": "$media:icon_start",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "orientation": "unspecified",
+        "backgroundModes": [
+          "audioPlayback"
+        ],
+        "skills": [
+          {
+            "entities": [
+              "entity.system.home"
+            ],
+            "actions": [
+              "action.system.home"
+            ]
+          }
+        ]
+      }
+    ],
+    // 说明：常规取视频走系统选择器（PhotoViewPicker/DocumentViewPicker），无需额外授权。
+    // READ_WRITE_DOWNLOAD_DIRECTORY 为受限权限（ACL），已在 AGC 申请并通过（PC/2in1、平板），
+    // 现在只服务一个场景：系统「下载」目录直扫导入视频（见 Index.ets scanDownload / 
+    // MediaRepository.downloadDir）。它与 profile 的 allowed-acls 一致，不影响 ACL 一致性校验。
+    // 音乐下载自 1.1111.06 起只写应用沙箱 files/Download，不需要任何存储权限，
+    // 也不再申请 FILE_ACCESS_PERSIST 做跨重启的目录 uri 授权（该权限不在 profile 里，
+    // 声明就会让 AGC 的 ACL 一致性校验不通过）。要给外部应用用走「导出到系统文件」。
+    // 联网权限用于影视数据抓取/在线播放/局域网目录与 WebDAV。
+    "requestPermissions": [
+      {
+        "name": "ohos.permission.INTERNET",
+        "reason": "$string:reason_internet",
+        "usedScene": {
+          "abilities": ["EntryAbility"],
+          "when": "always"
+        }
+      },
+      {
+        "name": "ohos.permission.GET_NETWORK_INFO",
+        "reason": "$string:reason_network",
+        "usedScene": {
+          "abilities": ["EntryAbility"],
+          "when": "always"
+        }
+      },
+      {
+        "name": "ohos.permission.MODIFY_AUDIO_SETTINGS",
+        "reason": "$string:reason_audio",
+        "usedScene": {
+          "abilities": ["EntryAbility"],
+          "when": "always"
+        }
+      },
+      {
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING",
+        "reason": "$string:reason_background",
+        "usedScene": {
+          "abilities": ["EntryAbility"],
+          "when": "always"
+        }
+      },
+      {
+        "name": "ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY",
+        "reason": "$string:reason_download",
+        "usedScene": {
+          "abilities": ["EntryAbility"],
+          "when": "inuse"
+        }
+      }
+      // 1.1111.06：ohos.permission.FILE_ACCESS_PERSIST 已删除 —— 音乐下载改为只写应用内
+      // 沙箱（files/Download），不再复用跨重启的目录 uri 授权；该权限不在 profile 的
+      // allowed-acls 里，留着会让 AGC 上传的 ACL 一致性校验不通过。
+    ]
+  }
+}

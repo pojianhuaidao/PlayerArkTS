@@ -1,0 +1,21 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/PlayerPage",
+    "pages/LocalListPage",
+    "pages/LocalPlayerPage",
+    "pages/NetEditPage",
+    "pages/SongDetailPage",
+    "pages/SettingsPage",
+    "tvbox/pages/HomePage",
+    "tvbox/pages/SearchPage",
+    "tvbox/pages/DetailPage",
+    "tvbox/pages/PlayerPage",
+    "tvbox/pages/LivePlayPage",
+    "tvbox/pages/HistoryPage",
+    "tvbox/pages/FavoritePage",
+    "tvbox/pages/PanConfigPage",
+    "tvbox/pages/PanLoginPage",
+    "tvbox/pages/TvSettingsPage"
+  ]
+}

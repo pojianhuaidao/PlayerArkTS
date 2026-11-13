@@ -1,0 +1,176 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "多媒体（本地视频/音乐/网络播放器）主模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "多媒体入口"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "多媒体"
+    },
+    {
+      "name": "app_title",
+      "value": "多媒体"
+    },
+    {
+      "name": "tab_video",
+      "value": "视频"
+    },
+    {
+      "name": "tab_folder",
+      "value": "文件夹"
+    },
+    {
+      "name": "tab_audio",
+      "value": "音频"
+    },
+    {
+      "name": "menu_search",
+      "value": "搜索"
+    },
+    {
+      "name": "menu_sort",
+      "value": "排序"
+    },
+    {
+      "name": "menu_more",
+      "value": "更多"
+    },
+    {
+      "name": "menu_settings",
+      "value": "设置"
+    },
+    {
+      "name": "menu_refresh",
+      "value": "刷新"
+    },
+    {
+      "name": "add_video",
+      "value": "添加视频"
+    },
+    {
+      "name": "empty_hint",
+      "value": "暂无视频，点击右下角添加"
+    },
+    {
+      "name": "count_videos",
+      "value": "共 %d 个视频"
+    },
+    {
+      "name": "unknown",
+      "value": "未知"
+    },
+    {
+      "name": "delete",
+      "value": "移除"
+    },
+    {
+      "name": "select_all",
+      "value": "全选"
+    },
+    {
+      "name": "cancel",
+      "value": "取消"
+    },
+    {
+      "name": "confirm",
+      "value": "确定"
+    },
+    {
+      "name": "play",
+      "value": "播放"
+    },
+    {
+      "name": "pause",
+      "value": "暂停"
+    },
+    {
+      "name": "player_subtitle",
+      "value": "字幕"
+    },
+    {
+      "name": "player_audio_track",
+      "value": "音轨"
+    },
+    {
+      "name": "player_loop",
+      "value": "循环"
+    },
+    {
+      "name": "player_aspect",
+      "value": "画面比例"
+    },
+    {
+      "name": "player_speed",
+      "value": "播放速度"
+    },
+    {
+      "name": "player_info",
+      "value": "媒体信息"
+    },
+    {
+      "name": "player_lock",
+      "value": "锁定"
+    },
+    {
+      "name": "player_unlock",
+      "value": "解锁"
+    },
+    {
+      "name": "player_load_subtitle",
+      "value": "载入字幕文件"
+    },
+    {
+      "name": "settings_gesture",
+      "value": "手势控制"
+    },
+    {
+      "name": "settings_gesture_desc",
+      "value": "滑动调节进度/音量/亮度，双击播放暂停，长按倍速"
+    },
+    {
+      "name": "settings_autoplay_next",
+      "value": "播完自动播放下一个"
+    },
+    {
+      "name": "settings_background",
+      "value": "后台播放"
+    },
+    {
+      "name": "settings_default_speed",
+      "value": "默认倍速"
+    },
+    {
+      "name": "settings_about",
+      "value": "关于"
+    },
+    {
+      "name": "settings_about_desc",
+      "value": "基于 HarmonyOS ArkTS 实现的本地视频播放器"
+    },
+    {
+      "name": "reason_internet",
+      "value": "用于获取影视数据与在线播放"
+    },
+    {
+      "name": "reason_network",
+      "value": "用于检测网络连接状态"
+    },
+    {
+      "name": "reason_audio",
+      "value": "用于调节播放音量"
+    },
+    {
+      "name": "reason_background",
+      "value": "用于投屏/后台播放保持运行"
+    },
+    {
+      "name": "reason_download",
+      "value": "用于读取 Download 目录中的视频文件并播放"
+    }
+  ]
+}

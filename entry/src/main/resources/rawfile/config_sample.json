@@ -1,0 +1,37 @@
+{
+  "spider": "",
+  "wallpaper": "",
+  "sites": [
+    {
+      "key": "heimuer",
+      "name": "黑木耳",
+      "type": 1,
+      "api": "https://json.heimuer.xyz/api.php/provide/vod/",
+      "searchable": 1,
+      "quickSearch": 0,
+      "filterable": 1,
+      "playerType": 1
+    },
+    {
+      "key": "ffm3u8",
+      "name": "飞狐",
+      "type": 1,
+      "api": "https://www.ffm3u8.com/api.php/provide/vod/",
+      "searchable": 1,
+      "quickSearch": 0,
+      "filterable": 1
+    },
+    {
+      "key": "haiwaikan",
+      "name": "海外看",
+      "type": 1,
+      "api": "https://haiwaikan.com/api.php/provide/vod/",
+      "searchable": 1,
+      "quickSearch": 0,
+      "filterable": 1
+    }
+  ],
+  "parses": [],
+  "lives": [],
+  "flags": ["youku","qq","iqiyi","qiyi","letv","sohu","tudou","mgtv","bilibili"]
+}

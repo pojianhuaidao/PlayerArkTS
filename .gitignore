@@ -1,0 +1,31 @@
+# HarmonyOS / DevEco Studio
+.hvigor/
+.idea/
+oh_modules/
+**/oh_modules/
+build/
+**/build/
+**/.cxx/
+.cxx/
+*.hap
+*.hsp
+*.app
+
+# 签名材料与私钥（禁止公开）
+key/
+*.p12
+*.p7b
+*.cer
+*.csr
+*.keystore
+
+# 构建产物与打包输出
+output/
+
+# 日志与崩溃转储
+*.log
+*.dmp
+
+# 系统文件
+.DS_Store
+Thumbs.db

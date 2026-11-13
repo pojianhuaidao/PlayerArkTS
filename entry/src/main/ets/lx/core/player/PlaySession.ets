@@ -1,0 +1,2768 @@
+import { LxPlayer, LxPlayerBufferListener, LxPlayerStateListener, LxPlayerTimeListener,
+  LxPlayerCompletionListener, LxPlayerStatus } from './LxPlayer';
+import { PlaybackCommand, PlaybackMediaInfo, PlaybackService } from './PlaybackService';
+import { SourceEngine } from '../source/SourceEngine';
+import { LxMusicInfo, fetchMusicPic, isSearchSupported, searchMusic } from '../music/MusicSearch';
+import { CoverStore } from '../music/CoverStore';
+import { AudioCache } from '../music/AudioCache';
+import { CachedLyricInfo, MediaCache, mediaKeyOf } from '../music/MediaCache';
+import { LyricLine, parseLyric } from '../music/Lyric';
+import { musicIdOf } from '../music/MusicId';
+import { PlatformLyric, fetchPlatformLyricWithFallback } from '../music/PlatformLyric';
+import { BridgeResult, LxQuality, SupportedSource } from '../source/LxTypes';
+import { PlayStateStore } from './PlayStateStore';
+import { ShuffleBag } from './ShuffleBag';
+import { PlaySettings } from '../settings/PlaySettings';
+import { fallbackQuality, isExtendedQuality, pickQuality } from '../music/Quality';
+import { AutoDownloadSong, downloadedFile, requestAutoDownload } from '../download/DownloadIndex';
+import { LocalMusic, LOCAL_SOURCE, isLocalSong } from '../local/LocalMusic';
+import { AutoMatchResult, autoMatchLyric } from '../local/LyricMatch';
+import { WebDavLibrary, isWebDavSong } from '../webdav/WebDavLibrary';
+import { WebDavClient } from '../webdav/WebDavClient';
+import { WebDavSettings } from '../webdav/WebDavSettings';
+import { WEBDAV_QUALITY } from '../webdav/WebDavTypes';
+import { BookEngine } from '../book/BookEngine';
+import { BookAudio, BookPlayPayload, BOOK_QUALITY, BOOK_SOURCE, bookShelfId, parseBookPayload } from '../book/BookTypes';
+import { BookShelf } from '../book/BookShelf';
+import { publishFavoriteIds } from './FavoriteIndex';
+import { common } from '@kit.AbilityKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+
+const DOMAIN: number = 0x0001;
+const TAG: string = 'PlaySession';
+
+/**
+ * 播放会话 / 播放队列 / 播放历史
+ *
+ * 界面层（各视图）通过 AppStorage 里的这几个 key 订阅「当前播放」的状态，
+ * 这样底部导航、迷你播放器、全屏播放器不用互相传参就能保持一致。
+ *
+ * 播放链路：条目里的 musicInfo（内置搜索得到）-> 导入的音源解析出播放链接 -> AVPlayer。
+ * 拿到手的条目可能没有 musicInfo（比如它来自当前音源脚本不支持的平台），所以这里补了一步：
+ * 遇到没有 musicInfo 的条目，先按「歌名 + 歌手」在当前音源支持的平台上搜一次，
+ * 拿到真实 musicInfo 再走源规则解析。少了这一步，表现出来就是「点了播放没有声音」。
+ */
+
+export const K_QUEUE_COUNT: string = 'ps_queue_count';
+export const K_CURRENT_ID: string = 'ps_current_id';
+export const K_CURRENT_NAME: string = 'ps_current_name';
+export const K_CURRENT_SINGER: string = 'ps_current_singer';
+export const K_CURRENT_COVER: string = 'ps_current_cover';
+export const K_CURRENT_ART: string = 'ps_current_art';
+export const K_CURRENT_QUALITY: string = 'ps_current_quality';
+export const K_PLAYER_STATUS: string = 'ps_player_status';
+export const K_PROGRESS: string = 'ps_progress';
+export const K_DURATION: string = 'ps_duration';
+export const K_PLAY_MODE: string = 'ps_play_mode';
+export const K_STATUS_TEXT: string = 'ps_status_text';
+/**
+ * 播放器是不是正在等数据（弱网缓冲）
+ *
+ * 与 K_PLAYER_STATUS 分开：缓冲时状态仍然是 playing（AVPlayer 自己会暂停又续上），
+ * 界面需要一个单独的信号来把它显示成「转圈」而不是「暂停」。
+ */
+export const K_BUFFERING: string = 'ps_buffering';
+/**
+ * 已缓冲到哪个位置（秒），给进度条上那条更长的灰色缓冲段用
+ *
+ * 注意是**位置**不是时长：AVPlayer 的 CACHED_DURATION 给的是「已缓冲数据还能播多久」，
+ * 加上当前播放位置才是「已经能播到哪儿」（见 PlaySession.pushBuffered）。
+ * 本地播放（下载的 / 播放缓存里的）没有缓冲事件，整首都在本地，直接按整首算。
+ */
+export const K_BUFFERED_SECONDS: string = 'ps_buffered_seconds';
+export const K_HISTORY_VERSION: string = 'ps_history_version';
+/**
+ * 底部迷你栏是展开还是折叠。
+ * HdsTabs 的 MiniBar 由 HDS 自己管宽度与动效，内容只能通过它给的
+ * onBarStyleChange 回调知道当前是哪种形态，所以把结果放到 AppStorage 里，
+ * 让 MiniBar 的内容组件自己订阅（不依赖 builder 是否被重新调用）。
+ */
+export const K_MINI_EXPANDED: string = 'ps_mini_expanded';
+/** 通知栏媒体卡 / 系统拉起应用后要求直达播放页的标志（EntryAbility 写、Index 消费） */
+export const K_OPEN_PLAYER_PENDING: string = 'ps_open_player_pending';
+/** 当前这首歌的歌词（LyricLine[]，由源的 lyric action 解析而来） */
+export const K_LYRIC_LINES: string = 'ps_lyric_lines';
+/** 歌词状态：none（没有/音源不支持）/ loading / ready */
+export const K_LYRIC_STATUS: string = 'ps_lyric_status';
+/**
+ * 音乐库版本号
+ *
+ * 歌单/收藏/播放队列被同步服务端改动后，会把队列、收藏、歌单整个换掉（见
+ * adoptLibraryState），此时订阅这个 key 的列表页需要重新读一次数据。
+ */
+export const K_LIBRARY_VERSION: string = 'ps_library_version';
+
+/**
+ * 音乐库变更的接收方
+ *
+ * 同步模块（LocalLibrary）实现它：界面上对歌单/收藏/播放队列的本地改动会经由它
+ * 转成上游的同步动作上行到服务端。PlaySession 本身不依赖同步模块，避免循环引用。
+ */
+export interface LibrarySink {
+  onLocalListsChanged(): void;
+}
+
+/** 队列 / 列表里的一首歌 */
+export interface SongItem {
+  id: string;
+  name: string;
+  singer: string;
+  coverUrl: string;
+  /** 无真实封面时是否使用上游内置的黑心占位封面 */
+  art: boolean;
+  /** 平台：kw / kg / mg / tx / wy；本地歌与云端歌带自己的 source（见 LOCAL_SOURCE） */
+  source: string;
+  quality: string;
+  /** mm:ss，列表里展示的时长 */
+  interval: string;
+  /** 真实搜索结果的 musicInfo JSON；没有 musicInfo 的条目为空串（走 resolveItem 再补） */
+  musicInfoJson: string;
+}
+
+/** 歌单列表项 */
+export interface PlaylistSummary {
+  id: string;
+  name: string;
+  count: number;
+}
+
+/** 音质协商与下载链路共用一份实现，见 core/music/Quality.ets */
+
+/** 落盘的播放现场；字段/含义变了就改版本号，读到不认识的版本当没有 */
+interface PersistedPlayState {
+  version: number;
+  /** 退出时正在播放的那首歌（整条存下来，队列里找不到也能显示/播放） */
+  current?: SongItem | null;
+  /** 退出时的播放进度（秒） */
+  position?: number;
+  playMode?: string;
+  history?: SongItem[];
+}
+
+const PLAY_STATE_VERSION: number = 1;
+
+/** 进度条那条灰段多久打一条诊断日志（毫秒） */
+const BUFFER_LOG_INTERVAL_MS: number = 5000;
+
+/** 系统媒体卡用的歌曲标识：有条目 id 就用 id，没有就退回「歌名 + 歌手」 */
+function assetIdOf(item: SongItem): string {
+  return item.id.length > 0 ? item.id : `${item.name}\u0001${item.singer}`;
+}
+
+function parseDuration(interval: string): number {
+  const parts: string[] = interval.split(':');
+  if (parts.length !== 2) {
+    return 0;
+  }
+  const minutes: number = parseInt(parts[0], 10);
+  const seconds: number = parseInt(parts[1], 10);
+  if (isNaN(minutes) || isNaN(seconds)) {
+    return 0;
+  }
+  return minutes * 60 + seconds;
+}
+
+function formatTime(seconds: number): string {
+  const total: number = Math.max(0, Math.floor(seconds));
+  const m: number = Math.floor(total / 60);
+  const s: number = total % 60;
+  return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+}
+
+/** 歌词是否带时间轴（`[00:12.34]`）：没有时间轴就没法跟着进度滚 */
+function hasTimeTag(lyric: string): boolean {
+  return /\[\d{1,2}:.*\d{1,4}\]/.test(lyric);
+}
+
+/** 歌名归一化：去掉空白与括号类修饰，只用于「哪条搜索结果更像这首歌」的判断 */
+function normalizeName(name: string): string {  let out: string = '';
+  for (let i = 0; i < name.length; i++) {
+    const ch: string = name.charAt(i).toLowerCase();
+    if (ch === ' ' || ch === '\t' || ch === '（' || ch === '）' || ch === '(' || ch === ')') {
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/** 缺 songmid 的条目用的序号（保证列表里的 key 唯一） */
+let itemSeq: number = 0;
+
+/**
+ * 两条记录是不是同一首歌
+ *
+ * 不能用 id 直接比：队列落库再读回来时，条目 id 会变成上游新格式的
+ * `${source}_${songmid}`（见 SyncConvert.fromLxMusicInfo），跟界面上的 `search_12` 对不上。
+ * 所以按 musicInfo 里的「平台 + 歌曲 id（+ 酷狗的 hash）」比，这才是一首歌的真正身份；
+ * 没有 musicInfo 的条目退回「歌名 + 歌手」。
+ */
+function sameSong(a: SongItem, b: SongItem): boolean {
+  const keyA: string = mediaKeyOf(a.musicInfoJson);
+  const keyB: string = mediaKeyOf(b.musicInfoJson);
+  if (keyA.length > 0 && keyB.length > 0) {
+    return keyA === keyB;
+  }
+  return a.name.length > 0 && a.name === b.name && a.singer === b.singer;
+}
+
+/**
+ * 是不是早期版本铺的演示条目（id 以 demo_ 开头）
+ *
+ * 只用于恢复播放现场时把它们丢掉：老版本的存档里可能还留着这种假歌。发布版不再产生
+ * 这种条目，所以新装的机器上这个判断永远为假。
+ */
+function isDemoEntry(item: SongItem): boolean {
+  return item.id.startsWith('demo_');
+}
+
+/** 由真实搜索结果转成队列条目 */
+export function songFromSearch(info: LxMusicInfo, quality: string): SongItem {
+  const json: string = JSON.stringify(info);
+  // id 用「平台 + songmid（+ 酷狗 hash）」这种稳定标识，不用序号：
+  // 收藏 / 歌单里的歌是从同步结构还原出来的，那边就是按这个规则算 id 的
+  // （见 core/music/MusicId），两边不一致会出现「收藏了却查不到」（爱心不亮、重复收藏）。
+  const songmid: string =
+    info.songmid !== undefined && info.songmid !== null ? String(info.songmid) : '';
+  if (songmid.length === 0) {
+    // 缺 songmid 的条目同步不出去（SyncConvert 判它不可同步），也就不会出现在
+    // 收藏/歌单里，这里退回序号保证列表里的 key 仍然唯一
+    itemSeq++;
+  }
+  return {
+    id: songmid.length > 0 ? musicIdOf(info) : `search_${itemSeq}`,
+    name: info.name ?? '',
+    singer: info.singer ?? '',
+    coverUrl: info.img ?? '',
+    art: false,
+    source: info.source ?? '',
+    quality: quality,
+    interval: info.interval ?? '',
+    musicInfoJson: json,
+  };
+}
+
+export class PlaySession {
+  private static instance: PlaySession | null = null;
+
+  static getInstance(): PlaySession {
+    if (PlaySession.instance === null) {
+      PlaySession.instance = new PlaySession();
+    }
+    return PlaySession.instance;
+  }
+
+  /** 播放队列（对应上游的「播放列表」） */
+  queue: SongItem[] = [];
+  currentIndex: number = -1;
+  /** 播放历史（我的 -> 播放历史） */
+  history: SongItem[] = [];
+  /** 收藏（我的 -> 收藏） */
+  favorites: SongItem[] = [];
+  /**
+   * 当前选中的音质
+   *
+   * 读写都转给 PlaySettings（设置 - 播放设置里的「播放音质」）：搜索结果、在线歌单
+   * 往条目里塞音质，用的都应该是同一份用户设置，不能各存一个默认值
+   * （搜索页那个音质选择器已经撤掉，只留设置页一个入口）。
+   */
+  get quality(): string {
+    return PlaySettings.getInstance().getQuality();
+  }
+
+  set quality(value: string) {
+    PlaySettings.getInstance().setQuality(value);
+  }
+  /**
+   * 播放模式，四种：
+   *   list    列表循环（放完最后一首回到第一首）
+   *   order   顺序播放（放完最后一首就停）
+   *   single  单曲循环（一首反复放；手动按上一首/下一首仍然换歌）
+   *   shuffle 随机播放
+   */
+  playMode: string = 'list';
+
+  private bootstrapped: boolean = false;
+  /**
+   * 音乐库是否已经把真实数据镜像进来
+   *
+   * 是则队列 / 收藏都已经是库里的数据，启动时不许再动它们；否说明是空库（首次安装、
+   * 没连同步、还没新建过歌单），界面就是空的。
+   */
+  private libraryLoaded: boolean = false;
+  private playerWired: boolean = false;
+  /** 歌名 -> 已经解析出真实 musicInfo 的条目，避免每次播放都重新搜索 */
+  private resolveCache: Map<string, SongItem> = new Map();
+  /**
+   * 正在飞着的云端歌匹配（key -> Promise）
+   *
+   * 封面与歌词都要用同一次平台匹配的结果，而两者是各自异步进来的（loadCover 先、
+   * loadLyric 后）。没有这张表的话第二条路会看到「已经在搜了」就放弃，
+   * 结果是「封面有了、歌词没了」。留着 Promise 让后来者等同一个结果。
+   */
+  private webdavMatches: Map<string, Promise<LxMusicInfo | null>> = new Map();
+  /**
+   * 正在飞着的本地歌匹配（key -> Promise）
+   *
+   * 同一首歌可能有两条路同时来问：歌词（`matchLocalLyric`）与评论
+   * （`platformIdentityOf`，本地歌带 `.lrc` 时歌词不会来问、评论却一定会）。
+   * 与云端歌同一套去重，避免为同一首歌连搜两轮平台。
+   */
+  private localMatches: Map<string, Promise<LxMusicInfo | null>> = new Map();
+  /** 正在等歌词的那首歌（切歌后旧歌词回来要丢掉） */
+  private lyricToken: string = '';
+  /** 切歌序号：只在最后一次切歌的链路里继续往下走 */
+  private playToken: number = 0;
+  /**
+   * 队列版本号：整体换队列 / 增删歌都 +1。
+   * 随机播放的一轮记录挂在它上面 —— 队列一换，之前的「放过哪些」就作废。
+   */
+  private queueVersion: number = 0;
+  /** 随机播放：这一轮走过的顺序（「上一首」按它往回退） */
+  private shuffleHistory: number[] = [];
+  /** 随机播放的抽签袋：本轮的「已放」记录由它管（见 ShuffleBag） */
+  private shuffleBag: ShuffleBag = new ShuffleBag();
+  /** 上一次打「灰段诊断日志」的时刻（节流用） */
+  private bufferLogAt: number = 0;
+  /**
+   * 预取时「预订」的随机下一首
+   *
+   * 随机的下一首是抽签抽出来的，预取必须先抽一次；预订下来之后真正切歌时就用这一首，
+   * 否则预取的和实际播的不是同一首，白下。三个字段一起校验预订还算不算数：
+   * 队列没换过、当前这首没变过。
+   */
+  private reservedNext: number = -1;
+  private reservedNextVersion: number = -1;
+  private reservedFrom: number = -1;
+  /** 界面提示（播放失败、缺音源等），由 UI 层挂一个 toast */
+  private noticeListener: ((text: string) => void) | null = null;
+  /** 同步模块挂上来的音乐库出口（未启用同步时为 null） */
+  private librarySink: LibrarySink | null = null;
+  /** 正在接受同步模块写入数据：此时不把自己的改动当作「本地改动」回传 */
+  private adoptingLibrary: boolean = false;
+  /**
+   * 这一轮播放的缓存现场
+   *
+   * 平台给的播放地址带时效，缓存里的地址可能已经过期。命中缓存却放不出来时，
+   * 丢掉这条缓存重新解析一次（上游 isRefresh 的等价做法），别让用户干看着失败。
+   */
+  private currentCacheKey: string = '';
+  private currentCacheQuality: string = '';
+  private currentUrlFromCache: boolean = false;
+  /** 这一轮是读本地缓存文件播的（文件坏了要删掉重来，别一直卡在这首） */
+  private currentLocalPath: string = '';
+  private urlRetried: boolean = false;
+  /** 播放现场落盘 */
+  private stateStore: PlayStateStore = new PlayStateStore();
+  private stateInited: boolean = false;
+  /**
+   * 已经读过上次的播放现场。
+   * 读之前一律不许回写：启动过程中音乐库镜像、bootstrap() 都会调 pushQueueState，
+   * 那时 currentIndex 还是 -1，回写就把存着的「正在播放」冲成空的了。
+   */
+  private stateRestored: boolean = false;
+  private lastPersistAt: number = 0;
+  /** 恢复现场后要接着放的位置（秒）+ 对应下标：等真正出声时再 seek */
+  private resumePosition: number = 0;
+  private resumeIndex: number = -1;
+  /**
+   * 上面那次「接着放」原本是暂停态（切音质时用户按着暂停）
+   *
+   * 重新解析出来的音频一定会先响一下，所以出声那一刻要立刻按回去。
+   * 只在同一次切档里有效：resumeIndex 一变（用户又切了别的歌）就作废，见 applyResumePaused。
+   */
+  private resumePaused: boolean = false;
+  /**
+   * 「这一次播放」指定要用哪一档音质（播放页切档用），空串 = 按设置协商
+   *
+   * 为什么需要这么个口子：协商是从设置那一档往下挑，而「拓展音质」开着时拓展档排在
+   * 普通档前面 —— 用户在播放页明明点了 320K，协商却可能给他母带。用户点了哪一档就放
+   * 哪一档，这里给一次性的指定；设置本身照改（下一次播放、下载链路都用新的那一档），
+   * 而协商出来的档仍然是「源与曲目都支持」的那一档（列表只列支持的）。
+   * 在 playAt 开头读走并清掉，避免漏给下一首。
+   */
+  private playQualityOverride: string = '';
+
+  /**
+   * 绑定沙箱目录（播放现场落盘用）。
+   * EntryAbility.onCreate 里调一次，必须早于 bootstrap()（它末尾会读现场）。
+   */
+  init(context: common.Context): void {
+    if (this.stateInited) {
+      return;
+    }
+    this.stateInited = true;
+    this.stateStore.init(context);
+  }
+
+  /**
+   * 清除已保存的音乐播放位置（只清位置，不动队列、歌单与音源）
+   *
+   * 供「清除播放记忆 / 清除本地记录」调用：删掉落盘的播放现场，
+   * 并把进度归零后回写一次，避免再被内存里的旧进度覆盖回去。
+   */
+  clearSavedProgress(): void {
+    if (this.stateInited) {
+      this.stateStore.clear();
+    }
+    AppStorage.setOrCreate<number>(K_PROGRESS, 0);
+    AppStorage.setOrCreate<number>(K_BUFFERED_SECONDS, 0);
+    if (this.stateInited && this.stateRestored) {
+      this.persistPlayState(true);
+    }
+  }
+
+  /**
+   * 把播放现场落盘
+   *
+   * 触发点都是低频的（切歌、增删队列、换播放模式、播放历史变化、退到后台），
+   * 再加 2 秒节流：pushQueueState 在一次切歌里会被调用好几次，不节流就是反复写文件。
+   */
+  persistPlayState(force: boolean = false): void {
+    if (!this.stateInited || !this.stateRestored) {
+      return;
+    }
+    const now: number = Date.now();
+    if (!force && now - this.lastPersistAt < 2000) {
+      return;
+    }
+    this.lastPersistAt = now;
+    const state: PersistedPlayState = {
+      version: PLAY_STATE_VERSION,
+      current: this.current,
+      position: AppStorage.get<number>(K_PROGRESS) ?? 0,
+      playMode: this.playMode,
+      history: this.history.slice(0, 100),
+    };
+    try {
+      this.stateStore.write(JSON.stringify(state));
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'failed to persist play state: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  /**
+   * 恢复上次的播放现场（bootstrap() 末尾调用一次）
+   *
+   * 不自动出声：只把「正在播的这首歌」摆回队列的当前项、进度条停在退出时的位置，
+   * 用户按播放时再从那里接着放（见 applyResumeSeek）。
+   */
+  private restorePlayState(): void {
+    if (this.stateInited) {
+      const text: string = this.stateStore.read();
+      if (text.length > 0) {
+        try {
+          this.applyPersistedState(text);
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'failed to restore play state: %{public}s', JSON.stringify(e));
+        }
+      }
+    }
+    // 从这里开始才允许回写
+    this.stateRestored = true;
+    this.pushQueueState();
+    this.pushHistoryState();
+  }
+
+  private applyPersistedState(text: string): void {
+    const state: PersistedPlayState = JSON.parse(text) as PersistedPlayState;
+    const current: SongItem | null | undefined = state.current;
+    if (state.version !== PLAY_STATE_VERSION || current === undefined || current === null
+      || current.id.length === 0 || isDemoEntry(current)) {
+      return;
+    }
+    if (state.history !== undefined && state.history.length > 0) {
+      // 演示条目一并丢掉：那是早期版本铺的假歌，不该跟着现场恢复回来
+      this.history = state.history.filter((item: SongItem) => !isDemoEntry(item));
+    }
+    if (state.playMode !== undefined && state.playMode.length > 0) {
+      this.playMode = state.playMode;
+    }
+    let index: number = -1;
+    for (let i = 0; i < this.queue.length; i++) {
+      if (sameSong(current, this.queue[i])) {
+        index = i;
+        break;
+      }
+    }
+    if (index < 0) {
+      // 队列里没有这首（没配同步 / 队列被清过）：放回队首，保证「继续播放」有歌可放
+      this.queue = [current].concat(this.queue);
+      index = 0;
+      this.bumpQueueVersion();
+    }
+    this.currentIndex = index;
+    const position: number = state.position !== undefined ? state.position : 0;
+    if (position > 0) {
+      this.resumePosition = position;
+      this.resumeIndex = index;
+      AppStorage.setOrCreate(K_PROGRESS, position);
+    }
+  }
+
+  /**
+   * 恢复现场后第一次真正出声时跳到退出时的位置。
+   * 不能在 playAt 里直接 seek：那时 AVPlayer 还在 prepare，seek 会被丢掉。
+   */
+  private applyResumeSeek(): void {
+    if (this.resumePosition <= 0 || this.resumeIndex !== this.currentIndex) {
+      return;
+    }
+    const position: number = this.resumePosition;
+    this.resumePosition = 0;
+    this.resumeIndex = -1;
+    hilog.info(DOMAIN, TAG, 'resume playback at %{public}d s', position);
+    LxPlayer.getInstance().seek(position * 1000);
+  }
+
+  /**
+   * 切音质时若原本是暂停态，重新出声后立刻按回去
+   *
+   * **必须在 applyResumeSeek 之前调**：那个方法一成功就把 resumeIndex 清成 -1，
+   * 之后这里就分不清「这次出声属于同一次切档」还是「用户已经切了别的歌」了。
+   */
+  private applyResumePaused(): void {
+    if (!this.resumePaused) {
+      return;
+    }
+    this.resumePaused = false;
+    if (this.resumeIndex !== this.currentIndex) {
+      return;
+    }
+    void LxPlayer.getInstance().pause();
+  }
+
+  setNoticeListener(listener: ((text: string) => void) | null): void {
+    this.noticeListener = listener;
+  }
+
+  setLibrarySink(sink: LibrarySink | null): void {
+    this.librarySink = sink;
+  }
+
+  /** 通知同步模块「歌单/收藏/播放队列有本地改动」（需要上行到服务端） */
+  private notifyLibrary(): void {
+    if (this.librarySink !== null && !this.adoptingLibrary) {
+      this.librarySink.onLocalListsChanged();
+    }
+  }
+
+  /**
+   * 用同步模块的数据整体替换界面状态（服务端推来 list_data_overwrite 或刚完成合并时）
+   *
+   * 走这里而不是直接赋值，是为了：1) 抑制上行（这些数据本来就来自服务端）；
+   * 2) 一并更新队列状态与版本号，让各列表页刷新。
+   */
+  adoptLibraryState(queue: SongItem[], favorites: SongItem[]): void {
+    // 正在播的那首如果还在新队列里就保持「当前」指向它，否则清掉当前项：
+    // 队列被换掉后还指着一首没在播的歌，迷你播放器显示的歌名会跟实际出声的对不上。
+    let nextIndex: number = -1;
+    const current: SongItem | null = this.current;
+    if (current !== null) {
+      for (let i = 0; i < queue.length; i++) {
+        if (queue[i].id === current.id) {
+          nextIndex = i;
+          break;
+        }
+      }
+    }
+    this.adoptingLibrary = true;
+    this.libraryLoaded = true;
+    try {
+      this.queue = queue;
+      this.favorites = favorites;
+      this.currentIndex = nextIndex;
+      this.bumpQueueVersion();
+      this.pushQueueState();
+      this.publishFavorites();
+    } finally {
+      this.adoptingLibrary = false;
+    }
+    const version: number = AppStorage.get<number>(K_LIBRARY_VERSION) ?? 0;
+    AppStorage.setOrCreate(K_LIBRARY_VERSION, version + 1);
+  }
+
+  private notify(text: string): void {
+    const listener = this.noticeListener;
+    if (listener !== null && text.length > 0) {
+      listener(text);
+    }
+  }
+
+  /**
+   * 接上播放器、把上次退出时的播放现场恢复回来（`pages/Index` 的 aboutToAppear 里调一次）
+   *
+   * **不铺任何数据**：空库就是空界面 —— 队列、收藏、歌单都为空，等用户自己搜、自己导入。
+   * （早期版本这里铺过一套与参考截图一致的演示歌单 / 演示队列，发布版不该再有这种东西：
+   * 用户会把它当成自己库里的数据，点进去还什么都没有。）
+   *
+   * 关键顺序：SyncManager 在 EntryAbility.onCreate 里就会把落过盘的库镜像进来
+   * （真实队列 / 收藏），Index 的 aboutToAppear 比它晚 —— 库已经镜像过就一个字都不能动，
+   * 否则既冲掉真实数据，又会让下一次本地改动把空收藏当成本地改动上行、清空云端收藏。
+   */
+  bootstrap(): void {
+    if (this.bootstrapped) {
+      return;
+    }
+    this.bootstrapped = true;
+    this.wirePlayer();
+
+    if (this.libraryLoaded) {
+      // 队列 / 收藏已经是音乐库里的真实数据，保持原样
+      this.restorePlayState();
+      return;
+    }
+
+    // 空库：只把「空」发布出去（界面上的爱心、队列计数要有个确定的初值），
+    // 播放历史也清空 —— 它是真实的使用记录，不能带任何预置内容
+    this.history = [];
+    this.favorites = [];
+    this.publishFavorites();
+    this.queue = [];
+    this.currentIndex = -1;
+    this.restorePlayState();
+  }
+
+  // ------------------------------------------------------------ 播放器接线
+
+  /**
+   * 播放状态与进度的唯一来源是 AVPlayer：
+   * 界面上的「正在播放」、进度条、播完自动下一首，都从这里回写，不再自己造。
+   */
+  private wirePlayer(): void {
+    if (this.playerWired) {
+      return;
+    }
+    this.playerWired = true;
+    const player = LxPlayer.getInstance();
+
+    const onState: LxPlayerStateListener = (status: LxPlayerStatus, message: string) => {
+      this.onPlayerState(status, message);
+    };
+    const onTime: LxPlayerTimeListener = (currentMs: number, durationMs: number) => {
+      AppStorage.setOrCreate(K_PROGRESS, Math.floor(currentMs / 1000));
+      if (durationMs > 0) {
+        AppStorage.setOrCreate(K_DURATION, Math.floor(durationMs / 1000));
+      }
+      // 缓冲段跟着往前走（缓冲事件只在数据变化时来，中间几秒要靠这里推）
+      this.pushBuffered();
+    };
+    const onCompleted: LxPlayerCompletionListener = () => {
+      this.onTrackCompleted();
+    };
+    const onBuffer: LxPlayerBufferListener = (buffering: boolean, bufferedEndMs: number) => {
+      this.onPlayerBuffer(buffering, bufferedEndMs);
+    };
+    player.addStateListener(onState);
+    player.addTimeListener(onTime);
+    player.addCompletionListener(onCompleted);
+    player.addBufferListener(onBuffer);
+
+    // 系统媒体控制（锁屏 / 控制中心 / 耳机）的指令回到这里，走的还是本会话自己的那套操作
+    const service = PlaybackService.getInstance();
+    service.setCommandListener((command: PlaybackCommand, positionMs: number) => {
+      this.onSystemCommand(command, positionMs);
+    });
+    // 播控中心的「收藏」与「循环模式」带参数，各自走一个监听
+    service.setFavoriteListener((assetId: string) => {
+      this.toggleFavoriteByAssetId(assetId);
+    });
+    service.setLoopModeListener((mode: string) => {
+      this.applyLoopMode(mode);
+    });
+  }
+
+  /**
+   * 播控中心点了「收藏」：按 assetId 找到那首歌，切换收藏状态
+   *
+   * assetId 是推给系统时的标识（见 assetIdOf），队列里没有（队列被换过、系统还拿着
+   * 旧的 assetId）就到收藏里找；两边都没有就忽略，不做无中生有的收藏。
+   * 收藏本身是参与同步的数据，所以这里走 addFavorite/removeFavorite，
+   * 改动会照常上行到同步服务端。
+   */
+  private toggleFavoriteByAssetId(assetId: string): void {
+    const item: SongItem | null = this.findByAssetId(assetId);
+    if (item === null) {
+      return;
+    }
+    if (this.isFavorite(item.id)) {
+      this.removeFavorite(item.id);
+      return;
+    }
+    this.addFavorite(item);
+  }
+
+  private findByAssetId(assetId: string): SongItem | null {
+    for (const item of this.queue) {
+      if (assetIdOf(item) === assetId) {
+        return item;
+      }
+    }
+    for (const item of this.favorites) {
+      if (assetIdOf(item) === assetId) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 播控中心要求切循环模式
+   *
+   * 系统给的可能是「目标模式」（setTargetLoopMode，文档语义就是切到它），
+   * 也可能是「当前模式」——官方 FAQ 说这种情况下由应用自己决定下一个模式。
+   * 两种语义都照顾到：给的模式跟当前不同就直接切，相同就当成「按了一下」往下轮一个。
+   * 无论如何都要把结果回推给播控中心，那颗按钮的图标就靠这个确认。
+   */
+  private applyLoopMode(mode: string): void {
+    if (mode !== 'list' && mode !== 'order' && mode !== 'single' && mode !== 'shuffle') {
+      return;
+    }
+    if (mode === this.playMode) {
+      this.cyclePlayMode();
+      return;
+    }
+    this.playMode = mode;
+    AppStorage.setOrCreate(K_PLAY_MODE, this.playMode);
+    PlaybackService.getInstance().updateLoopMode(this.playMode);
+    this.persistPlayState(true);
+  }
+
+  /** 把「当前这首歌是否收藏」推给播控中心（心形实心/空心） */
+  private pushFavoriteStateToSystem(): void {
+    const item: SongItem | null = this.current;
+    PlaybackService.getInstance().updateFavorite(item !== null && this.isFavorite(item.id));
+  }
+
+  /** 系统音乐服务的控制指令 -> 本会话的操作 */
+  private onSystemCommand(command: PlaybackCommand, positionMs: number): void {
+    if (command === 'play') {
+      this.systemPlay();
+      return;
+    }
+    if (command === 'pause') {
+      LxPlayer.getInstance().pause().catch((err: Error) => {
+        hilog.warn(DOMAIN, TAG, 'system pause failed: %{public}s', err.message);
+      });
+      return;
+    }
+    if (command === 'next') {
+      this.next();
+      return;
+    }
+    if (command === 'prev') {
+      this.prev();
+      return;
+    }
+    if (command === 'seek') {
+      this.seek(positionMs / 1000);
+      return;
+    }
+    // stop：暂停并把长时任务收掉（锁屏的停止键 / 耳机长按）
+    LxPlayer.getInstance().pause().catch((err: Error) => {
+      hilog.warn(DOMAIN, TAG, 'system stop failed: %{public}s', err.message);
+    });
+    PlaybackService.getInstance().stopPlayback();
+  }
+
+  /** 系统「播放」：暂停态直接续播（不重新解析链接），否则按当前条目重新加载 */
+  private async systemPlay(): Promise<void> {
+    const player = LxPlayer.getInstance();
+    const status: string = AppStorage.get<string>(K_PLAYER_STATUS) ?? 'idle';
+    if (status === 'loading' || status === 'playing') {
+      return;
+    }
+    if (status === 'paused' && player.getStatus() === 'paused') {
+      await player.resume();
+      return;
+    }
+    if (this.currentIndex >= 0) {
+      await this.playAt(this.currentIndex);
+      return;
+    }
+    if (this.queue.length > 0) {
+      await this.playAt(0);
+    }
+  }
+
+  /**
+   * 缓冲状态变化（弱网下「声音断了 → 续上」）
+   *
+   * 三件事：
+   *   1. 透给界面：播放中一旦开始等数据，播放钮转圈，用户知道是网络在拖而不是卡死了；
+   *   2. 刷新进度条上的缓冲段（缓冲到哪儿了）；
+   *   3. 叫一下播放缓存：缓冲结束意味着「可以让路了」，排队等带宽的缓存下载可以开工。
+   *      （反过来的方向由 AudioCache 自己判断：让路时它就不发下一块，见 canUseBandwidthForCache）
+   */
+  private onPlayerBuffer(buffering: boolean, _bufferedEndMs: number): void {
+    AppStorage.setOrCreate(K_BUFFERING, buffering);
+    this.pushBuffered();
+    if (!buffering) {
+      AudioCache.getInstance().resumeWaiting();
+    }
+  }
+
+  /**
+   * 刷新「已经能播到哪儿」（进度条上那条灰段）
+   *
+   * 口径与业界一致：画**播放器本地已加载**到哪儿（`LxPlayer.getBufferedEndMs()` →
+   * `getLoadedTimeRanges()`），也就是 iOS 的 `loadedTimeRanges`、web 的 `buffered`、
+   * ExoPlayer 的 `getBufferedPosition()` —— 各家进度条上那条浅色段都是这个。
+   * 本地播放整首都在本地，直接整条画满。
+   *
+   * 注意**不要**拿我们自己的整首缓存下载进度来画：那是同一首歌的**另一条连接**下的副本，
+   * 正在播的这一轮播放器看不到它，拿它画等于告诉用户「能播到这儿」，是假的
+   * （早前版本这么画过，见 docs/PLAYBACK_BUFFER.md）。
+   */
+  private pushBuffered(): void {
+    const player = LxPlayer.getInstance();
+    const durationMs: number = player.getDurationMs();
+    let bufferedMs: number = this.currentLocalPath.length > 0
+      ? durationMs
+      : player.getBufferedEndMs();
+    if (durationMs > 0 && bufferedMs > durationMs) {
+      bufferedMs = durationMs;
+    }
+    AppStorage.setOrCreate(K_BUFFERED_SECONDS, Math.floor(bufferedMs / 1000));
+    this.logBufferBar(durationMs, bufferedMs);
+  }
+
+  /**
+   * 每 5 秒记一条「灰段是按什么画出来的」
+   *
+   * 缓冲条这事来回猜了好几轮，索性把输入全打出来：总时长、写进 AppStorage 的值、
+   * 播放进度、播放器报的缓冲终点、我们整首缓存下到百分之几、是不是在放本地文件。
+   * 出问题时 `hdc shell hilog | grep "buffer bar"` 一眼就能看出是哪一路没动。
+   */
+  private logBufferBar(durationMs: number, bufferedMs: number): void {
+    const now: number = Date.now();
+    if (now - this.bufferLogAt < BUFFER_LOG_INTERVAL_MS) {
+      return;
+    }
+    this.bufferLogAt = now;
+    const player = LxPlayer.getInstance();
+    const fraction: number = this.currentCacheKey.length === 0 ? 0
+      : AudioCache.getInstance().cachedFraction(this.currentCacheKey, this.currentCacheQuality);
+    hilog.info(DOMAIN, TAG,
+      'buffer bar: buffered %{public}ds / total %{public}ds (progress %{public}ds, player end %{public}ds, cache %{public}d%%, local %{public}s)',
+      Math.floor(bufferedMs / 1000), Math.floor(durationMs / 1000),
+      Math.floor(player.getCurrentMs() / 1000), Math.floor(player.getBufferedEndMs() / 1000),
+      Math.round(fraction * 100), this.currentLocalPath.length > 0 ? 'yes' : 'no');
+  }
+
+  private onPlayerState(status: LxPlayerStatus, message: string): void {    if (status === 'playing') {
+      this.setStatus('playing', '正在播放');
+      // 切音质后接着放：先判暂停态（它要读 resumeIndex，applyResumeSeek 会把它清掉），
+      // 再跳到原来的位置
+      this.applyResumePaused();
+      // 重启恢复后第一次出声：跳到退出时的位置接着放
+      this.applyResumeSeek();
+      return;
+    }
+    if (status === 'paused') {
+      this.setStatus('paused', '已暂停');
+      // 主动暂停往往就是「要离开了」：把现场连同当前进度一起落盘
+      this.persistPlayState(true);
+      return;
+    }
+    if (status === 'loading') {
+      this.setStatus('loading', message);
+      return;
+    }
+    if (status === 'error') {
+      this.setStatus('error', message);
+      this.notify(message);
+      // 缓存出了问题才重试一次（源本身有问题时来回重试没有意义）：
+      //   - 本地缓存文件放不出来（截断 / 内容不对）：删掉它，改成联网播；
+      //   - 缓存的播放地址过期了：丢掉这条地址，重新解析。
+      if (!this.urlRetried) {
+        if (this.currentLocalPath.length > 0) {
+          this.urlRetried = true;
+          hilog.warn(DOMAIN, TAG, 'cached file failed, drop it: %{public}s', message);
+          AudioCache.getInstance().dropPath(this.currentLocalPath);
+          this.currentLocalPath = '';
+          void this.playAt(this.currentIndex);
+          return;
+        }
+        if (this.currentUrlFromCache && this.currentCacheKey.length > 0) {
+          this.urlRetried = true;
+          MediaCache.getInstance().dropMusicUrl(this.currentCacheKey, this.currentCacheQuality);
+          hilog.warn(DOMAIN, TAG, 'cached url failed, refresh: %{public}s', message);
+          void this.playAt(this.currentIndex);
+          return;
+        }
+      }
+      return;
+    }
+    // idle / stopped 由会话自己管（切歌、清空队列），这里不覆盖
+  }
+
+  // ------------------------------------------------------------ 状态同步
+
+  private pushQueueState(): void {
+    AppStorage.setOrCreate(K_QUEUE_COUNT, this.queue.length);
+    AppStorage.setOrCreate(K_PLAY_MODE, this.playMode);
+    if (this.currentIndex >= 0 && this.currentIndex < this.queue.length) {
+      const item: SongItem = this.queue[this.currentIndex];
+      AppStorage.setOrCreate(K_CURRENT_ID, item.id);
+      AppStorage.setOrCreate(K_CURRENT_NAME, item.name);
+      AppStorage.setOrCreate(K_CURRENT_SINGER, item.singer);
+      AppStorage.setOrCreate(K_CURRENT_COVER, item.coverUrl);
+      AppStorage.setOrCreate(K_CURRENT_ART, item.art);
+      AppStorage.setOrCreate(K_CURRENT_QUALITY, item.quality);
+      AppStorage.setOrCreate(K_DURATION, parseDuration(item.interval));
+      this.syncMediaInfo(item);
+    } else {
+      AppStorage.setOrCreate(K_CURRENT_ID, '');
+      AppStorage.setOrCreate(K_CURRENT_NAME, '');
+      AppStorage.setOrCreate(K_CURRENT_SINGER, '');
+      AppStorage.setOrCreate(K_CURRENT_COVER, '');
+      AppStorage.setOrCreate(K_CURRENT_ART, false);
+      AppStorage.setOrCreate(K_CURRENT_QUALITY, '128k');
+      AppStorage.setOrCreate(K_DURATION, 0);
+      AppStorage.setOrCreate(K_PROGRESS, 0);
+    }
+    // 队列 / 当前曲目 / 播放模式都变了，顺手把播放现场落盘（内部有节流）
+    this.persistPlayState();
+  }
+
+  /**
+   * 把当前歌曲推给系统媒体卡（锁屏 / 控制中心 / 车机）
+   *
+   * assetId 必须唯一标识一首歌：系统靠它判断是「换歌」还是「同一首更新信息」。
+   * 上一首 / 下一首按队列给（列表循环，所以首尾相接），系统的媒体卡据此
+   * 决定上一首/下一首按钮是否可用。
+   * 封面是异步解析的，解析出来后 pushQueueState/loadCover 会再调一次这里。
+   */
+  private syncMediaInfo(item: SongItem): void {
+    const count: number = this.queue.length;
+    const index: number = this.currentIndex;
+    let previousAssetId: string = '';
+    let nextAssetId: string = '';
+    if (count > 1 && index >= 0 && index < count) {
+      previousAssetId = assetIdOf(this.queue[index === 0 ? count - 1 : index - 1]);
+      nextAssetId = assetIdOf(this.queue[index === count - 1 ? 0 : index + 1]);
+      // 顺序播放的两个头尾没有「上一首 / 下一首」，别让播控中心那两颗按钮亮着
+      if (this.playMode === 'order') {
+        if (index === 0) {
+          previousAssetId = '';
+        }
+        if (index === count - 1) {
+          nextAssetId = '';
+        }
+      }
+    }
+    const info: PlaybackMediaInfo = {
+      assetId: assetIdOf(item),
+      title: item.name,
+      artist: item.singer,
+      album: '',
+      durationMs: parseDuration(item.interval) * 1000,
+      coverUrl: item.coverUrl,
+      previousAssetId: previousAssetId,
+      nextAssetId: nextAssetId,
+      isFavorite: this.isFavorite(item.id),
+    };
+    PlaybackService.getInstance().updateMedia(info);
+  }
+
+  private pushHistoryState(): void {
+    const version: number = AppStorage.get<number>(K_HISTORY_VERSION) ?? 0;
+    AppStorage.setOrCreate(K_HISTORY_VERSION, version + 1);
+  }
+
+  private setStatus(status: string, text: string = ''): void {
+    AppStorage.setOrCreate(K_PLAYER_STATUS, status);
+    AppStorage.setOrCreate(K_STATUS_TEXT, text);
+  }
+
+  // ------------------------------------------------------------ 解析真实播放条目
+
+  /** 从当前音源声明的平台里挑一个「既能搜、又能取播放链接」的 */
+  private pickSearchPlatform(): string {
+    const map: Record<string, SupportedSource> = SourceEngine.getInstance().getSupportedSources();
+    for (const key of Object.keys(map)) {
+      const source: SupportedSource = map[key];
+      if (isSearchSupported(key) && source.actions.includes('musicUrl')) {
+        return key;
+      }
+    }
+    return '';
+  }
+
+  private bestMatch(results: LxMusicInfo[], item: SongItem): LxMusicInfo {
+    const target: string = normalizeName(item.name);
+    for (const info of results) {
+      if (normalizeName(info.name) === target) {
+        return info;
+      }
+    }
+    for (const info of results) {
+      const name: string = normalizeName(info.name);
+      if (name.includes(target) || target.includes(name)) {
+        return info;
+      }
+    }
+    return results[0];
+  }
+
+  /** 给没有 musicInfo 的条目（音源脚本不支持的平台）搜一个真实 musicInfo */
+  private async resolveItem(item: SongItem): Promise<SongItem> {
+    const key: string = `${item.name}\u0001${item.singer}`;
+    const cached: SongItem | undefined = this.resolveCache.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const engine = SourceEngine.getInstance();
+    const platform: string = this.pickSearchPlatform();
+    if (platform.length === 0) {
+      throw new Error('当前音源没有可搜索的平台，无法为这首歌找资源');
+    }
+    const keyword: string = item.singer.length > 0 ? `${item.name} ${item.singer}` : item.name;
+    const results: LxMusicInfo[] = await searchMusic(keyword, platform, 1, 15);
+    if (results.length === 0) {
+      throw new Error(`没有搜到「${item.name}」的可播放资源`);
+    }
+    const info: LxMusicInfo = this.bestMatch(results, item);
+    const resolved: SongItem = songFromSearch(info, item.quality);
+    // 展示层字段沿用原条目，避免列表里的封面/歌名跳来跳去
+    resolved.id = item.id;
+    resolved.name = item.name.length > 0 ? item.name : resolved.name;
+    resolved.singer = item.singer.length > 0 ? item.singer : resolved.singer;
+    if (resolved.coverUrl.length === 0) {
+      resolved.art = item.art;
+    }
+    if (engine.isInited()) {
+      resolved.quality = pickQuality(resolved.musicInfoJson, resolved.source, resolved.quality);
+    }
+    this.resolveCache.set(key, resolved);
+    return resolved;
+  }
+
+  /** 条目要么带上源支持的 musicInfo，要么能被搜出来；两者都没有就抛错 */
+  private async ensurePlayable(item: SongItem): Promise<SongItem> {
+    const map: Record<string, SupportedSource> = SourceEngine.getInstance().getSupportedSources();
+    if (item.musicInfoJson.length > 0) {
+      const source: SupportedSource | undefined = map[item.source];
+      if (source !== undefined && source.actions.includes('musicUrl')) {
+        return item;
+      }
+    }
+    return await this.resolveItem(item);
+  }
+
+  // 音质协商见 core/music/Quality.ets：播放与下载共用同一套规则（pickQuality /
+  // fallbackQuality），这里不再重复实现，免得两边挑出的档不一致。
+
+  // ------------------------------------------------------------ 播放控制
+
+  get current(): SongItem | null {
+    if (this.currentIndex < 0 || this.currentIndex >= this.queue.length) {
+      return null;
+    }
+    return this.queue[this.currentIndex];
+  }
+
+  /** 用一批歌曲替换播放队列并从 startIndex 开始播 */
+  async setQueueAndPlay(items: SongItem[], startIndex: number): Promise<void> {
+    this.queue = items.slice();
+    this.currentIndex = -1;
+    this.bumpQueueVersion();
+    this.pushQueueState();
+    // 播放队列即上游的「试听列表」，换队列要同步出去
+    this.notifyLibrary();
+    await this.playAt(startIndex);
+  }
+
+  /**
+   * 切换当前这首歌的音质（播放页那颗音质钮点出来的面板）
+   *
+   * 音质在这套实现里是**一份全局设置**（设置 - 播放设置 - 播放音质）：协商从它开始
+   * 往下退（见 Quality.pickQuality），下载链路读的也是同一份。所以这里「切档」= 改设置 +
+   * 用新档把这个位置重新解析一遍，而不是给这一首挂一个临时的档 —— 后者下一首就会跳回
+   * 原来的档，用户会觉得「切了没用」。
+   *
+   * 位置尽量不动：记下当前进度与暂停态，新音频第一次出声时会跳回原位置并恢复暂停态
+   * （与「重启后接着放」共用同一套机制，见 applyResumeSeek / applyResumePaused）。
+   * 切档必然要重新取一次播放地址，中间会有一次重新缓冲，这一点避免不了。
+   *
+   * @returns 是否处理了这次切换（false = 当前没有正在播的歌）
+   */
+  async switchQuality(quality: string): Promise<boolean> {
+    const index: number = this.currentIndex;
+    if (index < 0 || index >= this.queue.length) {
+      return false;
+    }
+    const settings = PlaySettings.getInstance();
+    if (isExtendedQuality(quality)) {
+      // 拓展档只有开着「拓展音质」时才会被协商到（见 PlaySettings.qualityCandidates）
+      settings.setExtendQuality(true);
+      settings.setExtendQualityType(quality);
+    } else {
+      settings.setQuality(quality);
+    }
+    const item: SongItem = this.queue[index];
+    if (item.quality === quality) {
+      // 已经在放这一档：设置记下来就够了，不必把正在响的音频打断重来
+      return true;
+    }
+    this.resumePosition = AppStorage.get<number>(K_PROGRESS) ?? 0;
+    this.resumeIndex = index;
+    this.resumePaused = (AppStorage.get<string>(K_PLAYER_STATUS) ?? 'idle') === 'paused';
+    // 这一次就用用户点的那一档（设置照改，见 playQualityOverride 的说明）
+    this.playQualityOverride = quality;
+    await this.playAt(index);
+    return true;
+  }
+
+  /**
+   * 播放一首本地音乐（导入到沙箱的音频文件）
+   *
+   * 与在线歌的区别：没有音源解析、没有音质协商、没有播放缓存与整首下载 —— 文件本来就在本地，
+   * 这些环节一律跳过。文件找不到时（用户清过应用数据、或手动删掉了副本）要明确说出来，
+   * 不能静默失败或者卡在 loading。
+   */
+  private async playLocalItem(item: SongItem, index: number, token: number): Promise<void> {
+    const music = LocalMusic.getInstance();
+    const key: string = music.keyOfId(item.id);
+    const path: string = key.length > 0 ? music.pathOf(key) : '';
+    if (path.length === 0) {
+      const message: string = `「${item.name}」的文件已经不在了，请重新导入本地音乐`;
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+    // 这几个现场变量是给「在线歌失败要重来」用的，本地歌一律清空
+    this.currentCacheKey = '';
+    this.currentCacheQuality = '';
+    this.currentUrlFromCache = false;
+    this.currentLocalPath = path;
+    this.setStatus('loading', '正在读取本地文件…');
+    // 封面与歌词：本地歌的封面在导入时就从内嵌标签里取好了（在 item.coverUrl 里），
+    // 歌词没有平台来源，两个调用都会自己早退
+    this.loadCover(item);
+    this.loadLyric(item);
+    this.pushQueueState();
+    try {
+      await LxPlayer.getInstance().playLocal(path);
+      if (this.playToken !== token) {
+        return;
+      }
+      // 队列里下一首可能是在线歌，预取照旧（本地歌自己会早退）
+      void this.prefetchNext(token, index);
+    } catch (e) {
+      const message: string = `「${item.name}」播放失败：${(e as Error).message}`;
+      hilog.error(DOMAIN, TAG, 'play local failed: %{public}s', (e as Error).message);
+      this.setStatus('error', message);
+      this.notify(message);
+    }
+  }
+
+  /**
+   * 播放一首云端音乐（自己 WebDAV 服务器上的音频）
+   *
+   * 与本地歌的区别：音频不在本机，要带上 Authorization 头去流播（见
+   * LxPlayer.playUrlWithHeaders）；与在线歌的区别：不问音源、不做音质协商
+   * （服务器上是什么码率就是什么码率）。
+   *
+   * 边听边下照旧交给 AudioCache（键就是条目 id，即 `webdav_<key>`），所以听过一遍的歌
+   * 下次直接读本地文件，预取下一首也一样 —— 与在线歌共用同一条缓存链路，
+   * 只是下载请求要自己带头（见 AudioCache 里 DownloadTask.headers）。
+   */
+  private async playWebDavItem(item: SongItem, index: number, token: number): Promise<void> {
+    const lib = WebDavLibrary.getInstance();
+    const key: string = lib.keyOfId(item.id);
+    const url: string = key.length > 0 ? lib.urlOf(key) : '';
+    if (url.length === 0) {
+      const message: string = `「${item.name}」已经不在云端曲库里了，请到「我的 - 云端音乐」重新添加`;
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+    const config = WebDavSettings.getInstance().config();
+    if (config.url.length === 0) {
+      const message: string = '请先在「设置 - WebDAV 云端音乐」里填好服务器地址';
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+    const headers: Record<string, string> = WebDavClient.getInstance().authHeaders(config);
+    // 条目 id 就是 mediaKeyOf(musicInfoJson)（都是 `webdav_<key>`），下载索引按它找文件
+    const cacheKey: string = item.id;
+    this.currentCacheKey = cacheKey;
+    this.currentCacheQuality = WEBDAV_QUALITY;
+    this.currentUrlFromCache = false;
+    this.currentLocalPath = '';
+    // 封面与歌词都不挡住出声（与在线歌一致）：封面在加入曲库/匹配时就取好了，
+    // 歌词先看同目录的 .lrc，其次平台匹配
+    this.loadCover(item);
+    this.loadLyric(item);
+    this.pushQueueState();
+
+    const audioCache = AudioCache.getInstance();
+    // 1) 已经缓存到本机：直接读本地文件，不联网
+    const local: string = audioCache.localPath(cacheKey, WEBDAV_QUALITY);
+    if (local.length > 0) {
+      audioCache.setPlayingPath(local);
+      this.currentLocalPath = local;
+      this.setStatus('loading', '正在读取缓存…');
+      try {
+        await LxPlayer.getInstance().playLocal(local);
+        if (this.playToken !== token) {
+          return;
+        }
+        void this.prefetchNext(token, index);
+        return;
+      } catch (e) {
+        // 缓存文件坏了（截断 / 上次下到一半的残留）：丢掉它，改走网络
+        hilog.warn(DOMAIN, TAG, 'webdav cache file failed, drop it: %{public}s', (e as Error).message);
+        audioCache.dropPath(local);
+        this.currentLocalPath = '';
+      }
+    }
+    audioCache.setPlayingPath('');
+
+    // 2) 带认证头流播
+    this.setStatus('loading', '正在连接云服务器…');
+    try {
+      await LxPlayer.getInstance().playUrlWithHeaders(url, headers);
+      if (this.playToken !== token) {
+        return;
+      }
+      // 3) 边听边下：下完整首，下次播放就走上面的本地分支
+      audioCache.cacheSong(cacheKey, WEBDAV_QUALITY, url, headers);
+      // 4) 预取下一首
+      void this.prefetchNext(token, index);
+    } catch (e) {
+      const message: string = `播放「${item.name}」失败：${(e as Error).message}`;
+      hilog.error(DOMAIN, TAG, 'play webdav failed: %{public}s', (e as Error).message);
+      this.setStatus('error', message);
+      this.notify(message);
+    }
+  }
+
+  /**
+   * 播放一集有声书
+   *
+   * 与云端歌（WebDAV）是同一条思路的第三条链路：音频地址不在条目里，要现场解析，
+   * 但解析方式不是「问音源」也不是「拼服务器地址」，而是「拿这一章的地址去问书源规则」
+   * （`ruleContent` 从章节页里挖出 mp3/m4a 直链）。
+   *
+   * 三个要点：
+   *   1. **要带书源的请求头**：有声书的音频 CDN 普遍校验 Referer（悦听、六月都是），
+   *      不带就是 403 —— 所以走 playUrlWithHeaders；
+   *   2. 有声书**没有歌词**，所以不调 loadLyric（否则会去平台接口白搜一轮）；
+   *      封面在加入书架/入队时就拿到了，也不重新解析；
+   *   3. 解析要几秒（书源规则可能还要再抓一两次网络），期间状态是 loading，
+   *      与在线歌一致由 AVPlayer 的 stateChange 决定何时真正显示「播放中」。
+   */
+  private async playBookItem(item: SongItem, index: number, token: number): Promise<void> {
+    const payload: BookPlayPayload | null = parseBookPayload(item.musicInfoJson);
+    if (payload === null) {
+      const message: string = `「${item.name}」缺听书信息，请回到书籍页重新点一次`;
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+    const source = BookEngine.getInstance().getSource(payload.sourceId);
+    if (source === null) {
+      const message: string = `这本书用的书源（${payload.sourceId}）已经被删掉了，请重新导入后再听`;
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+
+    this.currentCacheKey = item.id;
+    this.currentCacheQuality = BOOK_QUALITY;
+    this.currentUrlFromCache = false;
+    this.currentLocalPath = '';
+    this.loadCover(item);
+    this.pushQueueState();
+    // 听书记一下「听到第几集」，下次打开这本书直接续播
+    BookShelf.getInstance().updateProgress(bookShelfId(payload), payload.chapterIndex);
+
+    this.setStatus('loading', `正在解析「${item.name}」…`);
+    try {
+      const audio: BookAudio = await BookEngine.getInstance().resolveAudioOf(
+        payload.sourceId,
+        payload.bookUrl,
+        payload.bookName,
+        payload.chapterUrl,
+        payload.chapterName,
+        payload.chapterIndex
+      );
+      if (this.playToken !== token) {
+        return;
+      }
+      if (audio.url.length === 0) {
+        const message: string = `「${item.name}」没解析出音频地址（书源规则可能已失效，或这一集需要登录）`;
+        this.setStatus('error', message);
+        this.notify(message);
+        return;
+      }
+      const headers: Record<string, string> = BookEngine.getInstance().audioHeaders(payload.sourceId);
+      this.setStatus('loading', '正在缓冲…');
+      await LxPlayer.getInstance().playUrlWithHeaders(audio.url, headers);
+      if (this.playToken !== token) {
+        return;
+      }
+      hilog.info(DOMAIN, TAG, 'book chapter %{public}d playing: %{public}s (from %{public}s)',
+        index, item.name, audio.from);
+    } catch (e) {
+      if (this.playToken !== token) {
+        return;
+      }
+      const message: string = `播放「${item.name}」失败：${(e as Error).message}`;
+      hilog.error(DOMAIN, TAG, 'play book failed: %{public}s', (e as Error).message);
+      this.setStatus('error', message);
+      this.notify(message);
+    }
+  }
+
+  async playAt(index: number): Promise<void> {
+    if (index < 0 || index >= this.queue.length) {
+      return;
+    }
+    // 播放页指定的音质：只作用于这一次播放，读完即清（下面几条早退路径也不会漏给下一首）
+    const forcedQuality: string = this.playQualityOverride;
+    this.playQualityOverride = '';
+    // 每次切歌领一个号：解析/取链接要几秒，期间用户又点了别的歌的话，
+    // 旧的那次必须丢掉，不能等它回来把新歌覆盖掉
+    const token: number = ++this.playToken;
+    // 放的是另一首歌：上次退出时记下的续播位置作废
+    if (index !== this.resumeIndex) {
+      this.resumePosition = 0;
+      this.resumeIndex = -1;
+    }
+    this.currentIndex = index;
+    // 换了歌：预取时给随机播放预订的那一签作废（下一首重新抽）
+    this.clearReservedNext();
+    this.urlRetried = false;
+    this.currentLocalPath = '';
+    this.pushQueueState();
+
+    // 先把上一首停掉再解析：解析要几秒，期间旧歌还在响的话，界面上的进度条
+    // 会先走一段再被新歌重置回去——「先变后执行」就是这么来的。
+    await LxPlayer.getInstance().release();
+    if (this.playToken !== token) {
+      return;
+    }
+    AppStorage.setOrCreate(K_PROGRESS, 0);
+    // 换了歌：缓冲段清零，别把上一首的水位留在进度条上（LxPlayer 换实例时也已清零）
+    AppStorage.setOrCreate(K_BUFFERED_SECONDS, 0);
+    this.clearLyric();
+
+    let item: SongItem = this.queue[index];
+    this.recordHistory(item);
+
+    // 本地音乐（设备里导入进来的音频）：直接读沙箱文件，不联网、不看音源脸色。
+    // 位置必须在音源检查之前 —— 没导入音源的用户也要能听自己手机里的歌。
+    if (item.source === LOCAL_SOURCE) {
+      await this.playLocalItem(item, index, token);
+      return;
+    }
+
+    // 云端音乐（自己 WebDAV 服务器上的音频）：带 Authorization 头直接流播，
+    // 同样不看音源脸色，所以也排在音源检查之前。
+    if (isWebDavSong(item)) {
+      await this.playWebDavItem(item, index, token);
+      return;
+    }
+
+    // 听书（阅读书源里的有声书）：章节地址 -> 书源规则解析出音频直链再播。
+    // 与云端歌同一个道理：它自己会去抓直链，不依赖「当前加载的音源」。
+    if (item.source === BOOK_SOURCE) {
+      await this.playBookItem(item, index, token);
+      return;
+    }
+
+    const engine = SourceEngine.getInstance();
+    if (!engine.isInited()) {
+      const message: string = '请先在「设置 - 音源设置」导入并加载一个音源，才可以播放';
+      this.setStatus('error', message);
+      this.notify(message);
+      return;
+    }
+
+    this.setStatus('loading', `正在解析「${item.name}」…`);
+    try {
+      const resolved: SongItem = await this.ensurePlayable(item);
+      if (this.playToken !== token) {
+        return;
+      }
+      if (resolved !== item) {
+        // 原地补齐 musicInfo/封面/时长：队列是列表数组的浅拷贝，同一个对象
+        // 也躺在推荐/历史/收藏里，原地改它们才会一起显示封面与真实时长
+        this.applyResolved(item, resolved);
+        this.pushQueueState();
+      }
+      // 封面与歌词都不挡住出声：解析好了再各自回填
+      this.loadCover(item);
+      this.loadLyric(item);
+
+      // 有指定档就用指定档（播放页切档），否则按设置协商（见 playQualityOverride 的说明）
+      let quality: string = forcedQuality.length > 0
+        ? forcedQuality
+        : pickQuality(item.musicInfoJson, item.source, item.quality);
+      item.quality = quality;
+      AppStorage.setOrCreate(K_CURRENT_QUALITY, quality);
+
+      // ---------------------------------------------------------- 缓存 / 本地文件
+      const cacheKey: string = mediaKeyOf(item.musicInfoJson);
+      const audioCache = AudioCache.getInstance();
+      // 这一轮的缓存状态：出错时据此决定要不要丢掉缓存重来
+      this.currentCacheKey = cacheKey;
+      this.currentCacheQuality = quality;
+      this.currentUrlFromCache = false;
+      this.currentLocalPath = '';
+
+      // 0) 用户主动下载到本地的：优先放它。
+      // 下载是明确的用户意图、文件是长期保留的，比 LRU 播放缓存更该被优先使用：
+      // 离线能放、也不看音源脸色（音源失效时下载过的歌照样能听）。
+      //
+      // 打不开就往下走（联网重放）：下载到用户目录（Download/、或手选的目录）的文件，
+      // 系统给的是「会话级」访问授权，重启后可能已经读不到（要长期授权得申请受限 ACL
+      // 权限 FILE_ACCESS_PERSIST，见 module.json5 里的说明）。这种情况不该让整首歌
+      // 直接失败，能联网就照常放。
+      const downloaded: string = downloadedFile(cacheKey.length > 0 ? cacheKey : item.id);
+      if (downloaded.length > 0) {
+        try {
+          audioCache.setPlayingPath('');
+          this.currentLocalPath = downloaded;
+          this.setStatus('loading', '正在读取已下载文件…');
+          await LxPlayer.getInstance().playLocal(downloaded);
+          void this.prefetchNext(token, index);
+          return;
+        } catch (e) {
+          this.currentLocalPath = '';
+          hilog.warn(DOMAIN, TAG, 'play downloaded file failed, fallback to online: %{public}s',
+            (e as Error).message);
+        }
+      }
+
+      // 1) 本地音频缓存命中：直接读沙箱文件，不联网、也不看源脚本的脸色
+      const local: string = audioCache.localPath(cacheKey, quality);
+      if (local.length > 0) {
+        audioCache.setPlayingPath(local);
+        this.currentLocalPath = local;
+        this.setStatus('loading', '正在读取缓存…');
+        await LxPlayer.getInstance().playLocal(local);
+        void this.prefetchNext(token, index);
+        return;
+      }
+      audioCache.setPlayingPath('');
+
+      // 2) 播放地址缓存（上游的 @music_url__<id>_<quality>）
+      const mediaCacheRef = MediaCache.getInstance();
+      let url: string = mediaCacheRef.getMusicUrl(cacheKey, quality);
+      const fromCache: boolean = url.length > 0;
+      if (!fromCache) {
+        // 刚启动时音源可能还在自动恢复（见 SourceEngine.restoreLastSource）：
+        // 等它一下再解析，别让「开了应用马上点播放」直接报「音源未加载」。
+        if (engine.isRestoring() && !engine.isInited()) {
+          this.setStatus('loading', '正在准备音源…');
+          await engine.whenInited(10000);
+          if (this.playToken !== token) {
+            return;
+          }
+        }
+        try {
+          url = await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source);
+        } catch (err) {
+          // 拓展音质（母带 / 全景声…）多半要会员，拿不到链接是常态：
+          // 退回普通音质再试一次，别让「开了拓展音质」变成有些歌直接放不了。
+          const retry: string = fallbackQuality(item.musicInfoJson, item.source, quality);
+          if (retry.length === 0) {
+            throw err as Error;
+          }
+          hilog.warn(DOMAIN, TAG, 'resolve %{public}s failed, retry with %{public}s',
+            quality, retry);
+          quality = retry;
+          item.quality = retry;
+          // 缓存现场也要跟着改：这条链接真放不出来时要按「实际用的那一档」丢缓存
+          this.currentCacheQuality = retry;
+          AppStorage.setOrCreate(K_CURRENT_QUALITY, retry);
+          url = await engine.getMusicUrl(item.musicInfoJson, retry as LxQuality, item.source);
+        }
+        if (this.playToken !== token) {
+          return;
+        }
+        if (cacheKey.length > 0) {
+          mediaCacheRef.saveMusicUrl(cacheKey, quality, url);
+        }
+      }
+      this.currentUrlFromCache = fromCache;
+      this.setStatus('loading', '正在缓冲…');
+      // 真正的「正在播放」由 AVPlayer 的 stateChange 决定（见 onPlayerState），
+      // 这里不提前改状态，避免没出声界面就先显示播放中
+      await LxPlayer.getInstance().playUrl(url);
+      // 3) 边播边缓存：下完整首，下次播放就走上面的本地分支。
+      //    开了「缓存时自动下载」则交给下载器，文件直接落在下载文件夹里（见 autoDownload）
+      if (!(audioCache.isAutoDownload() && this.autoDownload(item, cacheKey, quality))) {
+        audioCache.cacheSong(cacheKey, quality, url);
+      }
+      // 4) 预取下一首：切歌时直接读本地文件，不用现场解析 + 缓冲
+      void this.prefetchNext(token, index);
+    } catch (e) {
+      if (this.playToken !== token) {
+        return;
+      }
+      const message: string = `播放「${item.name}」失败：${(e as Error).message}`;
+      this.setStatus('error', message);
+      this.notify(message);
+    }
+  }
+
+  /**
+   * 「缓存时自动下载」：把这首歌排给下载器，而不是放进沙箱里的播放缓存
+   *
+   * 返回 false 表示下载器不收 —— 本地歌、云端歌（WebDAV）、没有 musicInfo 的条目，
+   * 或者下载器还没就绪。调用方必须照旧走播放缓存，不能让这首歌既下不了又缓不上。
+   *
+   * 排进去之后把沙箱里那份缓存删掉（dropKey）：同一首歌不必占两处地方，而且用户
+   * 在下载管理里删掉它时，「本地这份就没了、下次播放要重新下」这条承诺才成立。
+   */
+  private autoDownload(item: SongItem, key: string, quality: string): boolean {
+    const song: AutoDownloadSong = {
+      id: item.id,
+      name: item.name,
+      singer: item.singer,
+      coverUrl: item.coverUrl,
+      art: item.art,
+      source: item.source,
+      quality: quality,
+      interval: item.interval,
+      musicInfoJson: item.musicInfoJson,
+    };
+    if (!requestAutoDownload(song)) {
+      return false;
+    }
+    if (key.length > 0) {
+      AudioCache.getInstance().dropKey(key);
+    }
+    hilog.info(DOMAIN, TAG, 'auto download queued: %{public}s (%{public}s)', item.name, quality);
+    return true;
+  }
+
+  /**
+   * 预取下一首
+   *
+   * 切歌时的卡顿主要来自「切的这一刻才开始干活」：解析播放链接（要走音源沙箱 + 平台接口）
+   * 加上首屏缓冲。这两件事都能提前到上一首还在播的时候做：
+   *   1. 先把播放地址解析出来存进地址缓存（MediaCache），切歌时是命中缓存、不用等解析；
+   *   2. 再把音频交给播放缓存（AudioCache）慢慢下，下完了切过去就是直接读本地文件 ——
+   *      不联网、不缓冲，弱网下也能瞬间出声。
+   *
+   * 预取永远不抢当前这首的带宽：真正下载的时机由 AudioCache 按「播放优先」决定
+   * （见 LxPlayer.canUseBandwidthForCache），这里只负责把活儿排上去。
+   * 开了「缓存时自动下载」时不走缓存这条路：直接排给下载器（同一个让路判断，
+   * 见 DownloadManager.pump），也就不必在这里先把地址解析一遍。
+   *
+   * 拿不到 musicInfo 的条目跳过：那要先按歌名搜一次，代价比预取本身还大，
+   * 留到真正切过去时再解析（走 ensurePlayable 那条路）。
+   */
+  private async prefetchNext(token: number, from: number): Promise<void> {
+    const index: number = this.prefetchIndex(from);
+    if (index < 0 || index === from || index >= this.queue.length) {
+      return;
+    }
+    const item: SongItem = this.queue[index];
+    if (item.musicInfoJson.length === 0) {
+      return;
+    }
+    // 本地歌不用预取：文件已经在本地了（预取是「提前把在线歌下下来」）
+    if (item.source === LOCAL_SOURCE) {
+      return;
+    }
+    // 云端歌的预取：地址就在曲库里（不用解析），只需要把请求头带上排给 AudioCache
+    if (isWebDavSong(item)) {
+      this.prefetchWebDav(item);
+      return;
+    }
+    // 听书不预取：每一集都要跑一遍书源规则（可能有多次网络往返）才拿到直链，
+    // 提前解析的收益比不上它抢走的带宽与站点压力，留到真正切过去时再解析
+    if (item.source === BOOK_SOURCE) {
+      return;
+    }
+    const engine = SourceEngine.getInstance();
+    if (!engine.isInited()) {
+      return;
+    }
+    try {
+      const quality: string = pickQuality(item.musicInfoJson, item.source, item.quality);
+      const key: string = mediaKeyOf(item.musicInfoJson);
+      if (key.length === 0) {
+        return;
+      }
+      const cache = AudioCache.getInstance();
+      if (cache.localPath(key, quality).length > 0) {
+        // 已经是本地文件了，切过去本来就不用联网
+        return;
+      }
+      // 开了「缓存时自动下载」：直接排给下载器（它自己解析地址，不必在这里先解析一遍），
+      // 文件进下载文件夹，切过去时走「已下载文件」那条分支
+      if (cache.isAutoDownload() && this.autoDownload(item, key, quality)) {
+        return;
+      }
+      let url: string = MediaCache.getInstance().getMusicUrl(key, quality);
+      if (url.length === 0) {
+        url = await engine.getMusicUrl(item.musicInfoJson, quality as LxQuality, item.source);
+        if (this.playToken !== token) {
+          // 解析期间用户又切歌了：这一签作废，地址也别往缓存里写
+          return;
+        }
+        MediaCache.getInstance().saveMusicUrl(key, quality, url);
+      }
+      cache.prefetchSong(key, quality, url);
+    } catch (e) {
+      // 预取失败不打扰用户：真切到这一首时照常现场解析，只是会慢一点
+      hilog.info(DOMAIN, TAG, 'prefetch next failed: %{public}s', (e as Error).message);
+    }
+  }
+
+  /**
+   * 预取的下一首是队列里的第几首（-1 = 这一次不预取）
+   *
+   * 按播放模式算：
+   *   - 单曲循环：下一首还是它自己，没有可预取的；
+   *   - 列表循环 / 顺序播放：就是下一首（列表循环到最后一首回到第一首，顺序播放到头则不预取）；
+   *   - 随机播放：抽一签「预订」下来，切歌时就用这一签（见 takeReservedShuffle），
+   *     否则预取的和真正播的不是同一首，白下。
+   */
+  private prefetchIndex(from: number): number {
+    const total: number = this.queue.length;
+    if (total === 0 || from < 0 || from >= total) {
+      return -1;
+    }
+    const mode: string = this.playMode;
+    if (mode === 'single') {
+      return -1;
+    }
+    if (mode === 'shuffle') {
+      if (this.reservedNext >= 0 && this.reservedNextVersion === this.queueVersion
+        && this.reservedFrom === this.currentIndex && this.reservedNext < total) {
+        return this.reservedNext;
+      }
+      const pick: number = this.peekShuffleIndex();
+      if (pick < 0) {
+        return -1;
+      }
+      this.reservedNext = pick;
+      this.reservedNextVersion = this.queueVersion;
+      this.reservedFrom = this.currentIndex;
+      return pick;
+    }
+    if (from + 1 < total) {
+      return from + 1;
+    }
+    return mode === 'list' ? 0 : -1;
+  }
+
+  /** 把解析出来的真实字段写回原条目（原对象被歌单/推荐/历史共用） */
+  private applyResolved(target: SongItem, resolved: SongItem): void {
+    target.musicInfoJson = resolved.musicInfoJson;
+    target.source = resolved.source;
+    target.quality = resolved.quality;
+    if (resolved.interval.length > 0) {
+      target.interval = resolved.interval;
+    }
+    if (target.coverUrl.length === 0) {
+      target.coverUrl = resolved.coverUrl;
+    }
+    if (target.coverUrl.length > 0) {
+      target.art = false;
+    }
+  }
+
+  /** 当前这首歌的封面：搜索结果没有就按平台接口 / 源的 pic 解析，好了回填队列与播放栏 */
+  private loadCover(item: SongItem): void {
+    if (item.coverUrl.length > 0 || item.musicInfoJson.length === 0) {
+      return;
+    }
+    // 本地歌的封面在导入时就从内嵌标签里取好了（放进 item.coverUrl）；
+    // 这里再往平台接口 / 源脚本去问 source='local' 的封面只会白跑一趟
+    if (item.source === LOCAL_SOURCE) {
+      return;
+    }
+    // 云端歌：同目录封面在加入曲库时就下好了；没有的话按平台匹配补一张
+    if (isWebDavSong(item)) {
+      this.loadWebDavCover(item);
+      return;
+    }
+    // 听书：封面来自书源搜索/详情，item.coverUrl 里已经有了；musicInfoJson 装的是
+    // 书籍载荷而不是 musicInfo，再往平台接口问就是把书当成歌名去搜，纯属白跑
+    if (item.source === BOOK_SOURCE) {
+      return;
+    }
+    CoverStore.getInstance().request(item.musicInfoJson, (url: string) => {
+      this.applyCoverUrl(item, url);
+    });
+  }
+
+  /** 封面到了：回填条目，若正是当前这首就同时推给播放栏与锁屏媒体卡 */
+  private applyCoverUrl(item: SongItem, url: string): void {
+    if (url.length === 0) {
+      return;
+    }
+    item.coverUrl = url;
+    item.art = false;
+    if (this.current === item) {
+      AppStorage.setOrCreate(K_CURRENT_COVER, url);
+      AppStorage.setOrCreate(K_CURRENT_ART, false);
+      // 封面到了再推一次，锁屏媒体卡才有图
+      this.syncMediaInfo(item);
+    }
+  }
+
+  // ------------------------------------------------------------ 云端歌的匹配（封面 / 歌词）
+
+  /**
+   * 云端歌的平台匹配（歌名 + 歌手 + 时长 -> 平台歌曲）
+   *
+   * 与本地歌用的是同一套「宁缺勿错」的打分（core/local/LyricMatch），因为问题是同一个：
+   * 云端文件同样没有平台身份，只有标签或文件名。结果落盘在曲库里（matchJson），
+   * 而且**只搜一次**（matchTried）——不然每放一次就联网搜一遍。
+   *
+   * 封面与歌词都要用这个结果，两边可能同时进来问，所以同一首歌只留一个在飞的 Promise，
+   * 后来者等同一个结果，不会出现「封面搜着、歌词因为去重被跳过」。
+   */
+  private webDavMatch(key: string, name: string, singer: string,
+    durationMs: number): Promise<LxMusicInfo | null> {
+    const inflight: Promise<LxMusicInfo | null> | undefined = this.webdavMatches.get(key);
+    if (inflight !== undefined) {
+      return inflight;
+    }
+    const pending: Promise<LxMusicInfo | null> = this.runWebDavMatch(key, name, singer, durationMs);
+    this.webdavMatches.set(key, pending);
+    pending.then((): void => {
+      this.webdavMatches.delete(key);
+    }).catch((): void => {
+      this.webdavMatches.delete(key);
+    });
+    return pending;
+  }
+
+  private async runWebDavMatch(key: string, name: string, singer: string,
+    durationMs: number): Promise<LxMusicInfo | null> {
+    const lib = WebDavLibrary.getInstance();
+    const existing: LxMusicInfo | null = lib.matchOf(key);
+    if (existing !== null) {
+      return existing;
+    }
+    const auto: boolean = PlaySettings.getInstance().getAutoMatchLyric();
+    if (!auto || lib.matchTried(key)) {
+      return null;
+    }
+    try {
+      const found: AutoMatchResult = await autoMatchLyric(name, singer, durationMs);
+      // 与本地歌同一口径：只有平台真的应答过才记「搜过了」，断网时不能记
+      if (found.searched) {
+        lib.markMatchTried(key);
+      }
+      if (found.match !== null) {
+        lib.saveMatch(key, found.match.source, JSON.stringify(found.match.info));
+        return found.match.info;
+      }
+      return null;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'webdav match failed: %{public}s', (e as Error).message);
+      return null;
+    }
+  }
+
+  /** 云端歌的封面：同目录图优先（加入曲库时已下好），否则用匹配到的平台封面 */
+  private loadWebDavCover(item: SongItem): void {
+    const lib = WebDavLibrary.getInstance();
+    const key: string = lib.keyOfId(item.id);
+    if (key.length === 0) {
+      return;
+    }
+    const known: LxMusicInfo | null = lib.matchOf(key);
+    if (known !== null) {
+      this.applyWebDavCover(item, key, known);
+      return;
+    }
+    this.webDavMatch(key, item.name, item.singer, lib.durationMsOf(key)).then((info: LxMusicInfo | null) => {
+      if (info !== null) {
+        this.applyWebDavCover(item, key, info);
+      }
+    }).catch((err: Error) => {
+      hilog.info(DOMAIN, TAG, 'webdav cover match failed: %{public}s', err.message);
+    });
+  }
+
+  private applyWebDavCover(item: SongItem, key: string, info: LxMusicInfo): void {
+    const lib = WebDavLibrary.getInstance();
+    const known: string = lib.coverUrlOfKey(key);
+    if (known.length > 0) {
+      this.applyCoverUrl(item, known);
+      return;
+    }
+    void fetchMusicPic(info).then((url: string) => {
+      if (url.length === 0) {
+        return;
+      }
+      // 存进曲库索引：下次启动不必再查一次
+      lib.saveRemoteCover(key, url);
+      this.applyCoverUrl(item, url);
+    }).catch((err: Error) => {
+      // 取封面失败不影响听歌：列表里那一行退回占位封面
+      hilog.info(DOMAIN, TAG, 'webdav cover fetch failed: %{public}s', err.message);
+    });
+  }
+
+  /** 云端歌的预取：地址在曲库里现成，把带头的一并排给 AudioCache */
+  private prefetchWebDav(item: SongItem): void {
+    const lib = WebDavLibrary.getInstance();
+    const key: string = lib.keyOfId(item.id);
+    const url: string = key.length > 0 ? lib.urlOf(key) : '';
+    if (url.length === 0) {
+      return;
+    }
+    const config = WebDavSettings.getInstance().config();
+    if (config.url.length === 0) {
+      return;
+    }
+    const cache = AudioCache.getInstance();
+    if (cache.localPath(item.id, WEBDAV_QUALITY).length > 0) {
+      // 已经是本地文件了，切过去本来就不用联网
+      return;
+    }
+    cache.prefetchSong(item.id, WEBDAV_QUALITY, url, WebDavClient.getInstance().authHeaders(config));
+  }
+
+  /**
+   * 歌词：源脚本声明了 lyric 就先问源，拿不到（或没有时间轴）就用内置平台歌词。
+   * 加载是异步的，用 lyricToken 挡住「切歌后旧歌词才回来」的情况。
+   */
+  private loadLyric(item: SongItem): void {
+    this.lyricToken = item.id;
+    if (item.musicInfoJson.length === 0) {
+      AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+      return;
+    }
+    // 本地歌的歌词：同名 .lrc 优先（精确、离线），其次在线匹配
+    if (item.source === LOCAL_SOURCE) {
+      this.loadLocalLyric(item);
+      return;
+    }
+    // 云端歌同理：服务器上同目录的 .lrc 优先，其次在线匹配
+    if (isWebDavSong(item)) {
+      this.loadWebDavLyric(item);
+      return;
+    }
+    // 有声书没有歌词：不往平台接口白搜一轮（载荷里也不是 musicInfo，搜不出东西）
+    if (item.source === BOOK_SOURCE) {
+      AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+      return;
+    }
+    AppStorage.setOrCreate(K_LYRIC_STATUS, 'loading');
+    const token: string = item.id;
+    this.fetchLyric(item).then((result: PlatformLyric) => {
+      this.applyLyricResult(token, result.lyric, result.tlyric);
+    }).catch(() => {
+      if (this.lyricToken === token) {
+        AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+        this.pushLyricToSystem('', '');
+      }
+    });
+  }
+
+  /** 解析并发布歌词（在线歌与本地歌共用一条出口） */
+  private applyLyricResult(token: string, lyric: string, tlyric: string): void {
+    if (this.lyricToken !== token) {
+      return;
+    }
+    const lines: LyricLine[] = parseLyric(lyric, tlyric);
+    AppStorage.setOrCreate(K_LYRIC_LINES, lines);
+    AppStorage.setOrCreate(K_LYRIC_STATUS, lines.length > 0 ? 'ready' : 'none');
+    // 同一份歌词也上推系统：播控中心按时间轴滚动显示，桌面歌词悬浮窗也用它
+    this.pushLyricToSystem(lyric, tlyric);
+  }
+
+  /**
+   * 本地歌的歌词
+   *
+   * 顺序：同名 `.lrc`（导入时一起拷进来的，精确匹配、离线可用）
+   *      -> 之前匹配好的平台歌词 -> 按设置自动匹配一次 -> 没有就是没有。
+   *
+   * 在线匹配是「猜」，所以匹配逻辑（core/local/LyricMatch）是宁缺勿错的：拿不准就
+   * 不显示，让用户在播放页手动选正确的（见 views/LyricMatchSheet.ets）。
+   */
+  private loadLocalLyric(item: SongItem): void {
+    const token: string = item.id;
+    const music = LocalMusic.getInstance();
+    const key: string = music.keyOfId(item.id);
+    if (key.length === 0) {
+      AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+      return;
+    }
+    const local: string = music.lrcTextOf(key);
+    if (local.length > 0) {
+      this.applyLyricResult(token, local, '');
+      return;
+    }
+    void this.matchLocalLyric(item, key, token);
+  }
+
+  /**
+   * 本地歌的平台匹配：有存好的匹配就直接用，否则按设置自动搜一次（只搜一次）
+   *
+   * 与云端歌的 `runWebDavMatch` 是一对。取歌词与取评论都要用它 —— 区别在于歌词那条路
+   * 「本地已经有 .lrc」时根本不会走到这里（见 `loadLocalLyric`），评论则一定会来问一次。
+   * 异常照旧往外抛，由调用方决定怎么善后（歌词那边收尾成「暂无歌词」）。
+   */
+  private async runLocalMatch(item: SongItem, key: string): Promise<LxMusicInfo | null> {
+    const music = LocalMusic.getInstance();
+    const existing: LxMusicInfo | null = music.matchOf(key);
+    if (existing !== null) {
+      return existing;
+    }
+    const auto: boolean = PlaySettings.getInstance().getAutoMatchLyric();
+    if (!auto || music.matchTried(key)) {
+      return null;
+    }
+    const found: AutoMatchResult = await autoMatchLyric(item.name, item.singer,
+      music.durationMsOf(key));
+    // 只有平台真的应答过才记「搜过了」：全平台都没连上（断网）时不能记，
+    // 否则第一次播放恰好没网的用户以后有网也不会再匹配，等于永久没有歌词
+    if (found.searched) {
+      music.markMatchTried(key);
+    }
+    if (found.match !== null) {
+      music.saveMatch(key, found.match.source, JSON.stringify(found.match.info));
+      return found.match.info;
+    }
+    return null;
+  }
+
+  /**
+   * 本地歌匹配的去重包装（与云端歌的 `webDavMatch` 同一套）
+   *
+   * 歌词与评论可能同时进来问同一个 key，留一个在飞的 Promise 让后来者等同一个结果。
+   */
+  private localMatch(item: SongItem, key: string): Promise<LxMusicInfo | null> {
+    const inflight: Promise<LxMusicInfo | null> | undefined = this.localMatches.get(key);
+    if (inflight !== undefined) {
+      return inflight;
+    }
+    const pending: Promise<LxMusicInfo | null> = this.runLocalMatch(item, key);
+    this.localMatches.set(key, pending);
+    pending.then((): void => {
+      this.localMatches.delete(key);
+    }).catch((): void => {
+      this.localMatches.delete(key);
+    });
+    return pending;
+  }
+
+  /** 本地歌的在线歌词：有存好的匹配就直接取词，否则按设置自动搜一次 */
+  private async matchLocalLyric(item: SongItem, key: string, token: string): Promise<void> {
+    AppStorage.setOrCreate(K_LYRIC_STATUS, 'loading');
+    try {
+      const info: LxMusicInfo | null = await this.localMatch(item, key);
+      if (this.lyricToken !== token) {
+        return;
+      }
+      if (info === null) {
+        AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+        return;
+      }
+      // 取词结果按条目 id 缓存（本地歌就是 local_<key>，与在线歌互不干扰）
+      const cached: CachedLyricInfo | null = MediaCache.getInstance().getLyric(item.id);
+      if (cached !== null) {
+        this.applyLyricResult(token, cached.lyric, cached.tlyric);
+        return;
+      }
+      const result: PlatformLyric = await fetchPlatformLyricWithFallback(info);
+      if (this.lyricToken !== token) {
+        return;
+      }
+      if (result.lyric.length > 0 && hasTimeTag(result.lyric)) {
+        MediaCache.getInstance().saveLyric(item.id, { lyric: result.lyric, tlyric: result.tlyric });
+      }
+      this.applyLyricResult(token, result.lyric, result.tlyric);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'local lyric failed: %{public}s', (e as Error).message);
+      if (this.lyricToken === token) {
+        AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+        this.pushLyricToSystem('', '');
+      }
+    }
+  }
+
+  /**
+   * 取「这首歌在平台上的身份」（评论这类功能要它）
+   *
+   * 三种来源各有各的来路：
+   *   - **音源音乐**（在线歌）：条目自己就带着平台 musicInfo（搜索 / 歌单 / 榜单结果都是平台的）；
+   *   - **本地音乐**：没有平台身份，只能靠匹配（与取歌词同一条链路、同一份结果）；
+   *   - **WebDAV 云端音乐**：同上。
+   *
+   * 为什么这里还要再匹配一次：取歌词那条路在「本地已经有 .lrc」「服务器同目录有 .lrc」时
+   * 根本不会走到匹配，而评论与歌词不一样 —— 它对本地文件毫无兴趣，**一定要平台身份**。
+   * 所以打开评论时按需补一次匹配：仍受「自动匹配歌词」开关约束，`matchTried` 记过的也不再搜，
+   * 不会出现「看一次评论就联网搜一轮」。
+   *
+   * 任何一步（解析失败 / 没有平台身份 / 匹配不到）都返回 null，
+   * 由界面负责说明「为什么看不到评论」。
+   */
+  async platformIdentityOf(item: SongItem): Promise<LxMusicInfo | null> {
+    try {
+      if (isWebDavSong(item)) {
+        const lib = WebDavLibrary.getInstance();
+        const key: string = lib.keyOfId(item.id);
+        if (key.length === 0) {
+          return null;
+        }
+        // 云端歌的匹配自带并发去重与「只搜一次」，与封面 / 歌词共用同一个结果
+        return await this.webDavMatch(key, item.name, item.singer, lib.durationMsOf(key));
+      }
+      if (isLocalSong(item)) {
+        const music = LocalMusic.getInstance();
+        const key: string = music.keyOfId(item.id);
+        if (key.length === 0) {
+          return null;
+        }
+        return await this.localMatch(item, key);
+      }
+      if (item.musicInfoJson.length === 0) {
+        return null;
+      }
+      return JSON.parse(item.musicInfoJson) as LxMusicInfo;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'resolve platform identity failed: %{public}s', (e as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * 云端歌的歌词
+   *
+   * 顺序与本地歌一致：服务器上同目录的 `.lrc`（加入曲库时一起取回来的，精确、离线）
+   * -> 之前匹配好的平台歌词 -> 按设置自动匹配一次 -> 没有就是没有。
+   */
+  private loadWebDavLyric(item: SongItem): void {
+    const token: string = item.id;
+    const lib = WebDavLibrary.getInstance();
+    const key: string = lib.keyOfId(item.id);
+    if (key.length === 0) {
+      AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+      return;
+    }
+    const local: string = lib.lrcTextOf(key);
+    if (local.length > 0) {
+      this.applyLyricResult(token, local, '');
+      return;
+    }
+    void this.matchWebDavLyric(item, key, token);
+  }
+
+  private async matchWebDavLyric(item: SongItem, key: string, token: string): Promise<void> {
+    const lib = WebDavLibrary.getInstance();
+    AppStorage.setOrCreate(K_LYRIC_STATUS, 'loading');
+    try {
+      let info: LxMusicInfo | null = lib.matchOf(key);
+      if (info === null) {
+        info = await this.webDavMatch(key, item.name, item.singer, lib.durationMsOf(key));
+      }
+      if (this.lyricToken !== token) {
+        return;
+      }
+      if (info === null) {
+        AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+        return;
+      }
+      // 匹配到手了，顺手把封面也补上（同一次结果，封面那条路可能已经补过了）
+      this.applyWebDavCover(item, key, info);
+      // 取词结果按条目 id 缓存（云端歌就是 webdav_<key>，与本地歌 / 在线歌互不干扰）
+      const cached: CachedLyricInfo | null = MediaCache.getInstance().getLyric(item.id);
+      if (cached !== null) {
+        this.applyLyricResult(token, cached.lyric, cached.tlyric);
+        return;
+      }
+      const result: PlatformLyric = await fetchPlatformLyricWithFallback(info);
+      if (this.lyricToken !== token) {
+        return;
+      }
+      if (result.lyric.length > 0 && hasTimeTag(result.lyric)) {
+        MediaCache.getInstance().saveLyric(item.id, { lyric: result.lyric, tlyric: result.tlyric });
+      }
+      this.applyLyricResult(token, result.lyric, result.tlyric);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'webdav lyric failed: %{public}s', (e as Error).message);
+      if (this.lyricToken === token) {
+        AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+        this.pushLyricToSystem('', '');
+      }
+    }
+  }
+
+  /** 用户手动匹配完歌词后，重新加载当前这首（见 LyricMatchSheet） */
+  refreshLyric(): void {
+    const item: SongItem | null = this.current;
+    if (item === null) {
+      return;
+    }
+    this.loadLyric(item);
+  }
+
+  /**
+   * 取词：平台源的 source 协议里本来就没有歌词能力（action 白名单只有 musicUrl），
+   * 所以内置平台歌词才是主力（kw/kg/tx，与上游一致）；源自带 lyric 时优先用源的。
+   *
+   * 取词前先查缓存（上游的 @lyric__<id>）：歌词是逐字不变的，没必要每次播放都重新请求、
+   * 也不会因为源脚本抽风导致「上次有词这次没词」。
+   */
+  private async fetchLyric(item: SongItem): Promise<PlatformLyric> {
+    const key: string = mediaKeyOf(item.musicInfoJson);
+    const cache = MediaCache.getInstance();
+    const cached: CachedLyricInfo | null = cache.getLyric(key);
+    if (cached !== null) {
+      return { lyric: cached.lyric, tlyric: cached.tlyric };
+    }
+    const result: PlatformLyric = await this.fetchLyricRemote(item);
+    if (key.length > 0 && result.lyric.length > 0 && hasTimeTag(result.lyric)) {
+      cache.saveLyric(key, { lyric: result.lyric, tlyric: result.tlyric });
+    }
+    return result;
+  }
+
+  private async fetchLyricRemote(item: SongItem): Promise<PlatformLyric> {
+    const engine = SourceEngine.getInstance();
+    if (engine.supportsAction(item.source, 'lyric')) {
+      try {
+        const json: string = await engine.getLyric(item.musicInfoJson, item.source);
+        const result = JSON.parse(json) as BridgeResult;
+        const lyric: string = result.data.lyric !== undefined ? result.data.lyric : '';
+        const tlyric: string = result.data.tlyric !== undefined ? result.data.tlyric : '';
+        // 源给了词但没有时间轴（只有纯文本）时继续走内置，否则歌词不会跟着滚
+        if (hasTimeTag(lyric)) {
+          return { lyric: lyric, tlyric: tlyric };
+        }
+        hilog.info(DOMAIN, TAG, 'source lyric for %{public}s has no time tag, use built-in',
+          item.source);
+      } catch (e) {
+        // 源取词失败（音源失效、源不支持等）就落到内置：歌词不该被音源死活绑架
+        hilog.warn(DOMAIN, TAG, 'source lyric failed for %{public}s: %{public}s',
+          item.source, (e as Error).message);
+      }
+    }
+    try {
+      const info: LxMusicInfo = JSON.parse(item.musicInfoJson) as LxMusicInfo;
+      const result: PlatformLyric = await fetchPlatformLyricWithFallback(info);
+      if (result.lyric.length === 0) {
+        hilog.info(DOMAIN, TAG, 'no lyric for %{public}s %{public}s', item.source, item.name);
+      }
+      return result;
+    } catch (e) {
+      return { lyric: '', tlyric: '' };
+    }
+  }
+
+  /** 切歌时先把上一首的歌词清掉，别让新歌配旧词 */
+  private clearLyric(): void {
+    this.lyricToken = '';
+    AppStorage.setOrCreate(K_LYRIC_LINES, []);
+    AppStorage.setOrCreate(K_LYRIC_STATUS, 'none');
+    // 播控中心 / 桌面歌词那边也一起清掉，免得停留在上一首的词上
+    PlaybackService.getInstance().updateLyric('');
+  }
+
+  /**
+   * 歌词上推系统（播控中心滚动歌词 + 桌面歌词悬浮窗）
+   *
+   * 只认带时间标签的歌词（LRC）：系统靠 [mm:ss.xx] 自己滚动，
+   * 没有时间标签的纯文本系统解析不了，会显示异常 — 这种就当作没有歌词。
+   * 原文没有时间轴但译文有时，用译文兜底。
+   */
+  private pushLyricToSystem(lyric: string, tlyric: string): void {
+    let lrc: string = '';
+    if (hasTimeTag(lyric)) {
+      lrc = lyric;
+    } else if (hasTimeTag(tlyric)) {
+      lrc = tlyric;
+    }
+    PlaybackService.getInstance().updateLyric(lrc);
+  }
+
+  async toggle(): Promise<void> {
+    const player = LxPlayer.getInstance();
+    const status: string = AppStorage.get<string>(K_PLAYER_STATUS) ?? 'idle';
+    // 正在解析/缓冲时按键无效，等这次操作有结果（状态由 AVPlayer 回调驱动）
+    if (status === 'loading') {
+      return;
+    }
+    if (status === 'playing') {
+      // 暂停/播放态都由 AVPlayer 的 stateChange 回写，这里不提前改状态
+      await player.pause();
+      return;
+    }
+    if (status === 'paused' && this.currentIndex >= 0 && player.getStatus() === 'paused') {
+      await player.resume();
+      return;
+    }
+    if (this.currentIndex >= 0) {
+      await this.playAt(this.currentIndex);
+    } else if (this.queue.length > 0) {
+      await this.playAt(0);
+    }
+  }
+
+  /** 拖动播放页进度条（秒） */
+  seek(seconds: number): void {
+    const value: number = seconds > 0 ? seconds : 0;
+    LxPlayer.getInstance().seek(value * 1000);
+    AppStorage.setOrCreate(K_PROGRESS, value);
+  }
+
+  async next(): Promise<void> {
+    if (this.queue.length === 0) {
+      return;
+    }
+    if (this.playMode === 'shuffle') {
+      // 预取时如果已经抽过签，就用那一签：保证「预取的那首」就是「真正播的那首」
+      const reserved: number = this.takeReservedShuffle();
+      const index: number = reserved >= 0 ? reserved : this.nextShuffleIndex();
+      if (index < 0) {
+        return;
+      }
+      this.shuffleHistory.push(this.currentIndex);
+      await this.playAt(index);
+      return;
+    }
+    const candidate: number = this.currentIndex + 1;
+    if (candidate >= this.queue.length) {
+      // 顺序播放：最后一首到头了就不动；列表循环 / 单曲循环绕回第一首
+      if (this.playMode === 'order') {
+        return;
+      }
+      await this.playAt(0);
+      return;
+    }
+    await this.playAt(candidate);
+  }
+
+  async prev(): Promise<void> {
+    if (this.queue.length === 0) {
+      return;
+    }
+    if (this.playMode === 'shuffle') {
+      await this.playAt(this.prevShuffleIndex());
+      return;
+    }
+    const candidate: number = this.currentIndex - 1;
+    if (candidate < 0) {
+      // 顺序播放：第一首之前没有了；其余模式绕回最后一首
+      if (this.playMode === 'order') {
+        return;
+      }
+      await this.playAt(this.queue.length - 1);
+      return;
+    }
+    await this.playAt(candidate);
+  }
+
+  /** 队列内容变了：随机播放的一轮记录作废（袋子按 queueVersion 自己重开），走过的顺序也作废 */
+  private bumpQueueVersion(): void {
+    this.queueVersion++;
+    this.shuffleHistory = [];
+  }
+
+  /**
+   * 随机播放的下一首：**一轮之内不重复**
+   *
+   * 袋子（ShuffleBag）自己管「本轮放过哪些」：queueVersion 变过就重开一轮。
+   */
+  private nextShuffleIndex(): number {
+    return this.shuffleBag.pick(this.queue.length, this.queueVersion, this.currentIndex, true);
+  }
+
+  /**
+   * 抽一签但不记（预取用）
+   *
+   * 见 ShuffleBag.pick 的 mark 参数：预取的那一签随时会作废，不能占本轮的名额。
+   */
+  private peekShuffleIndex(): number {
+    return this.shuffleBag.pick(this.queue.length, this.queueVersion, this.currentIndex, false);
+  }
+
+  /**
+   * 取走预取时预订的那一签（取走即作废）
+   *
+   * 返回 -1 表示没有可用的预订（没预取过、队列换过、当前这首已经变了），
+   * 调用方退回自己抽签。
+   */
+  private takeReservedShuffle(): number {
+    const index: number = this.reservedNext;
+    const usable: boolean = index >= 0 && index < this.queue.length
+      && this.reservedNextVersion === this.queueVersion
+      && this.reservedFrom === this.currentIndex;
+    this.reservedNext = -1;
+    this.reservedNextVersion = -1;
+    this.reservedFrom = -1;
+    if (!usable) {
+      return -1;
+    }
+    // 真的要播它了：按「本轮已放」记上
+    this.shuffleBag.markPlayed(index);
+    return index;
+  }
+
+  /** 当前这首变了：预取预订的那一签作废（随机/顺序都一样，下一首重新算） */
+  private clearReservedNext(): void {
+    this.reservedNext = -1;
+    this.reservedNextVersion = -1;
+    this.reservedFrom = -1;
+  }
+
+  /** 随机播放的上一首：先按本轮走过的记录往回退，没记录了就再随机一首没放过的 */
+  private prevShuffleIndex(): number {
+    while (this.shuffleHistory.length > 0) {
+      const back: number | undefined = this.shuffleHistory.pop();
+      if (back !== undefined && back >= 0 && back < this.queue.length && back !== this.currentIndex) {
+        // 退回的这首马上要播：记进本轮已放
+        this.shuffleBag.markPlayed(back);
+        return back;
+      }
+    }
+    return this.nextShuffleIndex();
+  }
+
+  /**
+   * 一首放完了，按播放模式决定下一步
+   *
+   *   单曲循环：重放这一首（手动按上一首/下一首才是换歌）
+   *   顺序播放：最后一首放完就停住（队列和当前曲目留着，可以重新点播放）
+   *   列表循环 / 随机播放：交给 next()
+   */
+  private onTrackCompleted(): void {
+    if (this.playMode === 'single' && this.currentIndex >= 0) {
+      void this.playAt(this.currentIndex);
+      return;
+    }
+    if (this.playMode === 'order' && this.currentIndex >= this.queue.length - 1) {
+      this.finishQueue();
+      return;
+    }
+    void this.next();
+  }
+
+  /** 顺序播放到底：停住，别继续出声也不占后台任务，队列留着让用户重播 */
+  private finishQueue(): void {
+    LxPlayer.getInstance().release();
+    PlaybackService.getInstance().stopPlayback();
+    this.clearLyric();
+    this.setStatus('stopped', '播放完毕');
+    AppStorage.setOrCreate(K_PROGRESS, 0);
+  }
+
+  /**
+   * 播放模式：列表循环 -> 顺序播放 -> 单曲循环 -> 随机播放 -> 列表循环
+   *
+   * 改完要推给播控中心，否则那边显示的循环图标跟实际播放行为对不上。
+   */
+  cyclePlayMode(): string {
+    if (this.playMode === 'list') {
+      this.playMode = 'order';
+    } else if (this.playMode === 'order') {
+      this.playMode = 'single';
+    } else if (this.playMode === 'single') {
+      this.playMode = 'shuffle';
+    } else {
+      this.playMode = 'list';
+    }
+    AppStorage.setOrCreate(K_PLAY_MODE, this.playMode);
+    PlaybackService.getInstance().updateLoopMode(this.playMode);
+    this.persistPlayState(true);
+    return this.playMode;
+  }
+
+  /** 播放模式的中文名（界面提示用） */
+  playModeLabel(): string {
+    if (this.playMode === 'order') {
+      return '顺序播放';
+    }
+    if (this.playMode === 'single') {
+      return '单曲循环';
+    }
+    if (this.playMode === 'shuffle') {
+      return '随机播放';
+    }
+    return '列表循环';
+  }
+
+  /**
+   * 「设置 - 播放设置 - 与其他应用同时播放」
+   *
+   * 设置项由 PlaySettings 落盘；这里额外把新值作用到当前播放器上，用户改完不用
+   * 切歌就能生效（下一首本来也会带上新值，见 LxPlayer.preparePlayer）。
+   */
+  setPlayWithOthers(value: boolean): void {
+    PlaySettings.getInstance().setPlayWithOthers(value);
+    LxPlayer.getInstance().setPlayWithOthers(value);
+  }
+
+  /**
+   * 「设置 - 播放设置 - 桌面歌词」（系统的歌词悬浮窗）
+   *
+   * 设置项由 PlaySettings 落盘；这里让播控服务立刻重新同步显隐，用户改完就见效，
+   * 不必等下一首或重启。
+   */
+  setDesktopLyric(value: boolean): void {
+    PlaySettings.getInstance().setDesktopLyric(value);
+    PlaybackService.getInstance().refreshDesktopLyric();
+  }
+
+  /**
+   * 「设置 - 播放设置 - 车载蓝牙歌词」
+   *
+   * 往 AVMetadata.singleLyricText 写「当前这一句」，由系统蓝牙模块送给车机／蓝牙音箱。
+   * 改完立刻重推一次：打开时不必等下一句（当句就上去），关闭时把字段清掉。
+   */
+  setBluetoothLyric(value: boolean): void {
+    PlaySettings.getInstance().setBluetoothLyric(value);
+    PlaybackService.getInstance().refreshBluetoothLyric();
+  }
+
+  /**
+   * 当前这首歌解析出来的播放链接（分享用）
+   *
+   * 优先拿这一轮已经在用的地址（播放时写进了元数据缓存），没有就按当前音质现解析一次。
+   * 拿不到（音源失效、这首歌没有 musicInfo 等）返回空串，调用方分享时不带链接即可。
+   *
+   * 注意：平台给的播放地址大多带时效，分享出去的链接过一阵会失效——这是平台侧的规则，
+   * 我们只能分享「当前解析出来的这一条」。
+   */
+  async currentMusicUrl(): Promise<string> {
+    const item: SongItem | null = this.current;
+    if (item === null || item.musicInfoJson.length === 0) {
+      return '';
+    }
+    const key: string = mediaKeyOf(item.musicInfoJson);
+    if (key.length > 0) {
+      const cached: string = MediaCache.getInstance().getMusicUrl(key, item.quality);
+      if (cached.length > 0) {
+        return cached;
+      }
+    }
+    const engine = SourceEngine.getInstance();
+    if (!engine.isInited()) {
+      return '';
+    }
+    try {
+      return await engine.getMusicUrl(item.musicInfoJson, item.quality as LxQuality, item.source);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'resolve url for share failed: %{public}s', (e as Error).message);
+      return '';
+    }
+  }
+
+  /** 把一首歌插到当前播放的下一首 */
+  addToQueue(item: SongItem, asNext: boolean = false): void {
+    if (asNext && this.currentIndex >= 0 && this.currentIndex < this.queue.length) {
+      this.queue.splice(this.currentIndex + 1, 0, item);
+    } else {
+      this.queue.push(item);
+    }
+    this.bumpQueueVersion();
+    this.pushQueueState();
+    this.notifyLibrary();
+  }
+
+  removeAt(index: number): void {
+    if (index < 0 || index >= this.queue.length) {
+      return;
+    }
+    const wasCurrent: boolean = index === this.currentIndex;
+    this.queue.splice(index, 1);
+    if (index < this.currentIndex) {
+      this.currentIndex--;
+    } else if (wasCurrent) {
+      this.currentIndex = Math.min(this.currentIndex, this.queue.length - 1);
+    }
+    this.bumpQueueVersion();
+    this.pushQueueState();
+    this.notifyLibrary();
+  }
+
+  clearQueue(): void {
+    this.queue = [];
+    this.currentIndex = -1;
+    this.bumpQueueVersion();
+    LxPlayer.getInstance().release();
+    // 没歌了就别再占着后台播放长时任务
+    PlaybackService.getInstance().stopPlayback();
+    this.clearLyric();
+    this.setStatus('idle');
+    this.pushQueueState();
+    this.notifyLibrary();
+  }
+
+  // ------------------------------------------------------------ 收藏（我的 -> 收藏）
+
+  /** 收藏这首歌（重复收藏会被忽略） */
+  addFavorite(item: SongItem): boolean {
+    for (const entry of this.favorites) {
+      if (entry.id === item.id) {
+        return false;
+      }
+    }
+    this.favorites.unshift(item);
+    this.publishFavorites();
+    this.pushHistoryState();
+    this.notifyLibrary();
+    this.pushFavoriteStateToSystem();
+    return true;
+  }
+
+  /**
+   * 把收藏名单发布到 AppStorage
+   *
+   * 歌曲行上的爱心用 @StorageLink 直接读这份名单：它自己判断实心/空心，不依赖
+   * 宿主把状态传下去（懒加载列表不会因为宿主重绘就重跑已有的行）。
+   */
+  private publishFavorites(): void {
+    const list: string[] = [];
+    for (const entry of this.favorites) {
+      list.push(entry.id);
+    }
+    publishFavoriteIds(list);
+  }
+
+  /**
+   * 批量收藏：把一批歌加进收藏（已经在收藏里的跳过），返回实际加进去的数量
+   *
+   * 逐首调 addFavorite 的话每首都上行一次同步（整份 love 列表覆盖），
+   * 一张几百首的歌单就是几百次；所以这里一次性改完，只通知一次。
+   * 新收藏的排在最前面、并保持传入顺序（与单首收藏一致：最近收藏的在最上面）。
+   */
+  addFavorites(items: SongItem[]): number {
+    const fresh: SongItem[] = [];
+    for (const item of items) {
+      let exists: boolean = false;
+      // 同一批里也可能有重复 id，边收边比
+      for (const entry of this.favorites) {
+        if (entry.id === item.id) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists) {
+        for (const entry of fresh) {
+          if (entry.id === item.id) {
+            exists = true;
+            break;
+          }
+        }
+      }
+      if (exists) {
+        continue;
+      }
+      fresh.push(item);
+    }
+    if (fresh.length === 0) {
+      return 0;
+    }
+    this.favorites = fresh.concat(this.favorites);
+    const added: number = fresh.length;
+    this.publishFavorites();
+    this.pushHistoryState();
+    this.notifyLibrary();
+    this.pushFavoriteStateToSystem();
+    return added;
+  }
+
+  /** 取消收藏 */
+  removeFavorite(id: string): boolean {
+    const remains: SongItem[] = [];
+    for (const entry of this.favorites) {
+      if (entry.id !== id) {
+        remains.push(entry);
+      }
+    }
+    if (remains.length === this.favorites.length) {
+      return false;
+    }
+    this.favorites = remains;
+    this.publishFavorites();
+    this.pushHistoryState();
+    this.notifyLibrary();
+    this.pushFavoriteStateToSystem();
+    return true;
+  }
+
+  /**
+   * 批量取消收藏：把一批歌从收藏里摘掉，返回实际摘掉的数量
+   *
+   * 与 addFavorites 同一个理由：逐首调 removeFavorite 的话每首都会上行一次同步
+   * （整份 love 列表覆盖），所以这里一次性改完、只通知一次。
+   * 歌单详情页多选里的「取消收藏」走的就是它（内置收藏歌单里删歌 / 取消收藏）。
+   */
+  removeFavorites(ids: string[]): number {
+    if (ids.length === 0) {
+      return 0;
+    }
+    const remains: SongItem[] = [];
+    for (const entry of this.favorites) {
+      if (ids.indexOf(entry.id) < 0) {
+        remains.push(entry);
+      }
+    }
+    const removed: number = this.favorites.length - remains.length;
+    if (removed === 0) {
+      return 0;
+    }
+    this.favorites = remains;
+    this.publishFavorites();
+    this.pushHistoryState();
+    this.notifyLibrary();
+    this.pushFavoriteStateToSystem();
+    return removed;
+  }
+
+  clearFavorites(): void {
+    if (this.favorites.length === 0) {
+      return;
+    }
+    this.favorites = [];
+    this.publishFavorites();
+    this.pushHistoryState();
+    this.notifyLibrary();
+    this.pushFavoriteStateToSystem();
+  }
+
+  isFavorite(id: string): boolean {
+    for (const entry of this.favorites) {
+      if (entry.id === id) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 本地音乐被删掉了：把已经打不开的条目从收藏 / 历史 / 队列里一起摘掉
+   *
+   * 摘掉的原因很直接 —— 文件已经删了，留着就是点一下就报错的幽灵条目。
+   * 正在播的那首被删掉就停住：继续放只会对着一个不存在的文件读到错误。
+   */
+  dropLocalSongs(ids: string[]): void {
+    if (ids.length === 0) {
+      return;
+    }
+    const currentId: string = this.current !== null ? this.current.id : '';
+
+    const keptFavorites: SongItem[] = [];
+    for (const entry of this.favorites) {
+      if (!ids.includes(entry.id)) {
+        keptFavorites.push(entry);
+      }
+    }
+    const favoritesChanged: boolean = keptFavorites.length !== this.favorites.length;
+    if (favoritesChanged) {
+      this.favorites = keptFavorites;
+      this.publishFavorites();
+      this.pushFavoriteStateToSystem();
+    }
+
+    const keptHistory: SongItem[] = [];
+    for (const entry of this.history) {
+      if (!ids.includes(entry.id)) {
+        keptHistory.push(entry);
+      }
+    }
+    if (keptHistory.length !== this.history.length) {
+      this.history = keptHistory;
+    }
+
+    const keptQueue: SongItem[] = [];
+    let queueChanged: boolean = false;
+    for (const entry of this.queue) {
+      if (ids.includes(entry.id)) {
+        queueChanged = true;
+        continue;
+      }
+      keptQueue.push(entry);
+    }
+    if (queueChanged) {
+      this.queue = keptQueue;
+      // 当前下标要按「还在播的那首歌」重新认一遍，不能沿用旧下标
+      let nextIndex: number = -1;
+      if (currentId.length > 0) {
+        for (let i = 0; i < keptQueue.length; i++) {
+          if (keptQueue[i].id === currentId) {
+            nextIndex = i;
+            break;
+          }
+        }
+      }
+      const stoppedCurrent: boolean = currentId.length > 0 && nextIndex < 0;
+      this.currentIndex = nextIndex;
+      this.bumpQueueVersion();
+      if (stoppedCurrent) {
+        LxPlayer.getInstance().release();
+        PlaybackService.getInstance().stopPlayback();
+        this.clearLyric();
+        this.setStatus('idle', '这首歌已从本地音乐移除');
+      }
+    } else if (ids.includes(currentId)) {
+      // 队列里没有但正在播（理论上不会发生），保险起见一样停掉
+      LxPlayer.getInstance().release();
+      this.setStatus('idle', '这首歌已从本地音乐移除');
+    }
+
+    this.pushHistoryState();
+    this.pushQueueState();
+    this.persistPlayState(true);
+    this.notifyLibrary();
+  }
+
+  recordHistory(item: SongItem): void {
+    const rest: SongItem[] = [];
+    for (const entry of this.history) {
+      if (entry.name !== item.name || entry.singer !== item.singer) {
+        rest.push(entry);
+      }
+    }
+    rest.unshift(item);
+    this.history = rest.slice(0, 100);
+    this.pushHistoryState();
+    // 播放历史也是「现场」的一部分，切歌时一起落盘
+    this.persistPlayState(true);
+  }
+
+  clearHistory(): void {
+    this.history = [];
+    this.pushHistoryState();
+    this.persistPlayState(true);
+  }
+
+  /** 从播放历史里删掉几条（只删记录，文件与收藏都不动）；返回真删掉的条数 */
+  removeHistory(ids: string[]): number {
+    if (ids.length === 0) {
+      return 0;
+    }
+    const kept: SongItem[] = [];
+    for (const entry of this.history) {
+      if (!ids.includes(entry.id)) {
+        kept.push(entry);
+      }
+    }
+    const removed: number = this.history.length - kept.length;
+    if (removed > 0) {
+      this.history = kept;
+      this.pushHistoryState();
+      this.persistPlayState(true);
+    }
+    return removed;
+  }
+
+  formatProgress(seconds: number): string {
+    return formatTime(seconds);
+  }
+
+  formatDuration(seconds: number): string {
+    return formatTime(seconds);
+  }
+}

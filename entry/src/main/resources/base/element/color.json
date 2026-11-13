@@ -1,0 +1,36 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "mx_primary",
+      "value": "#3C8CF0"
+    },
+    {
+      "name": "mx_bg",
+      "value": "#FF121212"
+    },
+    {
+      "name": "mx_bg_card",
+      "value": "#FF1C1C1C"
+    },
+    {
+      "name": "mx_text_primary",
+      "value": "#FFF2F2F2"
+    },
+    {
+      "name": "mx_text_secondary",
+      "value": "#FF9E9E9E"
+    },
+    {
+      "name": "mx_divider",
+      "value": "#FF262626"
+    },
+    {
+      "name": "mx_player_bg",
+      "value": "#FF000000"
+    }
+  ]
+}

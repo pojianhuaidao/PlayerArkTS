@@ -1,0 +1,90 @@
+{
+  "app": {
+    // 签名材料已随项目内置：项目根 key/ 下的 video.p12 / 视频.cer / 视频Release.p7b（别名 shipin）
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "storeFile": "key/video.p12",
+          "storePassword": "0000001B83A9EB5C4888FAAEB9AD0E14AD0A98C92B8B4F28B3BA214ADCF8464477A05457AA273D7F61C526",
+          "keyAlias": "shipin",
+          "keyPassword": "0000001B1FB6DC2ABA68026AF05E2689BCED93708F320392219F5341A689823E3AD818E42E1D17E7A98B53",
+          "signAlg": "SHA256withECDSA",
+          "profile": "key/视频Release.p7b",
+          "certpath": "key/视频.cer"
+        }
+      },
+      {
+        // 侧载专用：同一 p12/cer，profile 换成 Debug（Release profile 的 app_gallery 分发类型无法 hdc install）
+        "name": "sideDebug",
+        "type": "HarmonyOS",
+        "material": {
+          "storeFile": "key/video.p12",
+          "storePassword": "0000001B83A9EB5C4888FAAEB9AD0E14AD0A98C92B8B4F28B3BA214ADCF8464477A05457AA273D7F61C526",
+          "keyAlias": "shipin",
+          "keyPassword": "0000001B1FB6DC2ABA68026AF05E2689BCED93708F320392219F5341A689823E3AD818E42E1D17E7A98B53",
+          "signAlg": "SHA256withECDSA",
+          "profile": "key/视频Debug.p7b",
+          "certpath": "key/视频.cer"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "6.1.0(23)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      },
+      {
+        "name": "sideDebug",
+        "signingConfig": "sideDebug",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "6.1.0(23)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        },
+        {
+          "name": "sideDebug",
+          "applyToProducts": [
+            "sideDebug"
+          ]
+        }
+      ]
+    }
+  ]
+}
