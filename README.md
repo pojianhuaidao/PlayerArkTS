@@ -310,6 +310,25 @@ hdc shell aa start -a EntryAbility -b tv.hm.o
 
 `build-profile.json5` 的 `signingConfigs.default` 直接引用工程内 `key/` 目录：`storeFile = key/video.p12`（别名 `shipin`，`SHA256withECDSA`）、`certpath = key/视频.cer`、`profile = key/视频Release.p7b`。更换证书或换绑设备时只需替换这三份文件与 `key/视频Debug.p7b`，无需改代码。
 
+### 8.6 开源仓库与签名材料（重要）
+
+**本 GitHub 公开仓库不包含任何签名材料。** `key/` 目录、`*.p12`、`*.cer`、`*.p7b`、`*.csr`、`*.keystore` 均已在 `.gitignore` 中排除，仓库内不存在证书、Profile 与密钥库文件。
+
+因此 clone / fork 本工程后，`build-profile.json5` 中的 `signingConfigs` 仍按 `key/` 路径书写（`storeFile = key/video.p12`、`certpath = key/视频.cer`、`profile = key/视频Release.p7b`），指向的文件在仓库里并不存在。DevEco Studio 打开工程时会提示签名配置无效，**需要自行生成并使用自己的签名材料**，处理方式二选一：
+
+- 删除 `build-profile.json5` 中的 `signingConfigs` 段与各 product 的 `signingConfig` 引用，改由 DevEco Studio 重新生成；
+- 或保留结构，把 `storeFile` / `certpath` / `profile` 改为指向自己生成的证书与 Profile，密码填自己的值。
+
+自行签名的常规路径：
+
+1. 注册华为开发者账号并完成实名认证，在 AGC 创建应用（若沿用 `tv.hm.o` 以外的包名，Profile 的 `bundle-name` 必须与 `AppScope/app.json5` 的 `bundleName` 完全一致）。
+2. 在 DevEco Studio 的 `File → Project Structure → Signing Configs` 中登录账号后一键自动生成，或在 AGC 手动生成 `.p12` 密钥库、`.cer` 证书与 `.p7b` Profile。
+3. debug 侧载使用的调试 Profile 必须绑定目标设备 UDID（`hdc shell bm get --udid` 获取），否则安装被拒（801 / 9568289）。
+
+**ACL 受限权限提醒**：本工程 `module.json5` 声明了受限权限 `ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY`（用于直扫系统「下载」目录，见 3.1 与第七节）。该权限属于 ACL 受限权限，**必须使用与你自己的 ACL 申请结果一致的签名材料**：需在 AGC 提交同名权限的 ACL 申请，并在你生成的 Profile 的 `allowed-acls` 中带上同名条目。用其它证书或未包含该 ACL 的 Profile 重签，会出现 ACL 一致性校验不通过，安装或运行期授权失败，**直扫系统下载目录的能力随之失效**。
+
+若你的使用场景不需要直扫下载目录，可删除 `module.json5` 中该受限权限声明，改用系统文件选择器或媒体库选择器导入文件（见 3.1 导入入口），此时普通调试签名即可正常运行。
+
 ---
 
 ## 九、版本号规则
